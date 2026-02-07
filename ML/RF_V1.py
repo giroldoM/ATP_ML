@@ -1,7 +1,7 @@
 import pandas as pd
 import plotly.express as px
 
-base = pd.read_csv('/Users/murillogiroldo/ATP_ML/data/atp_matches_2013.csv')
+base = pd.read_csv('/Users/murillogiroldo/ATP_ML/data/atp_matches_2010.csv')
 
 show = base.head()
 #mostrar quantos valores nulos tem em cada coluna
