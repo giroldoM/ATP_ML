@@ -45,6 +45,13 @@ class TrainConfig:
         "p2_elo_prob",    # Vazamento por Nulos (só existe pro winner)
         "p1_elo_pre",     # Já usamos elo_diff e elo_prob_p1, o valor bruto pode confundir se mal tratado
         "p2_elo_pre",
+        "elo_diff_wl", "p1_elo_prob", "p2_elo_prob", "p1_elo_pre", "p2_elo_pre",
+        
+        # NOVO: Leakage Surface (Raw values e probabilidades do WL)
+        "winner_elo_surface", "loser_elo_surface", # Colunas originais do WL
+        "p1_elo_surface", "p2_elo_surface",        # Colunas brutas pairwise (usamos só o diff)
+        
+        # ... (stats pós jogo mantenha iguais) ...
         
         # Stats pós-jogo
         "w_ace", "l_ace", "w_df", "l_df", "w_svpt", "l_svpt",

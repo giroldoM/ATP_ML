@@ -50,65 +50,97 @@ def elo_expected(r_a: float, r_b: float) -> float:
 # ----------------------------
 def add_elo_wl(df_wl: pd.DataFrame, elo_cfg: EloConfig) -> pd.DataFrame:
     """
-    Calcula Elo PRÉ-JOGO em df winner/loser (1 linha por match),
-    atualizando o rating UMA vez por partida (sem duplicação).
-
-    Requer colunas: date, winner_id, loser_id.
+    Calcula Elo PRÉ-JOGO (Global e por Superfície).
     """
     df = df_wl.copy()
 
-    # Ordenação defensiva + determinística (inclui tourney_id se existir)
+    # Garante ordenação temporal
     sort_cols = ["date"]
-    if "tourney_id" in df.columns:
-        sort_cols.append("tourney_id")
-    if "match_num" in df.columns:
-        sort_cols.append("match_num")
+    if "tourney_id" in df.columns: sort_cols.append("tourney_id")
+    if "match_num" in df.columns: sort_cols.append("match_num")
     df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
 
-    ratings: Dict[int, float] = {}
-    games: Dict[int, int] = {}
+    # 1. Estado Global
+    ratings_global: Dict[int, float] = {}
+    games_global: Dict[int, int] = {}
+    
+    # 2. Estado por Superfície
+    # Dicionário de dicionários: {'Hard': {id: elo}, 'Clay': {id: elo}, ...}
+    ratings_surface: Dict[str, Dict[int, float]] = {
+        "Hard": {}, "Clay": {}, "Grass": {}, "Carpet": {}
+    }
+    games_surface: Dict[str, Dict[int, int]] = {
+        "Hard": {}, "Clay": {}, "Grass": {}, "Carpet": {}
+    }
 
-    w_pre_list = []
-    l_pre_list = []
-    prob_w_list = []
+    # Listas para armazenar features globais
+    w_pre_global, l_pre_global = [], []
+    
+    # Listas para armazenar features da superfície específica DO JOGO
+    w_pre_surf, l_pre_surf = [], []
 
-    # itertuples é MUITO mais rápido que iterrows
+    # Iteração rápida
     for row in df.itertuples(index=False):
-        # ids podem vir como float (ex: 123.0), então força int via float()
         w = int(float(getattr(row, "winner_id")))
         l = int(float(getattr(row, "loser_id")))
+        
+        # Pega a superfície (Hard, Clay, etc.) - normaliza para Title Case
+        # Se não tiver surface, assume Hard como fallback ou ignora updates específicos
+        surface = getattr(row, "surface", "Hard")
+        if not isinstance(surface, str): surface = "Hard"
+        surface = surface.strip().title()
+        if surface not in ratings_surface: surface = "Hard" # Fallback para Carpet ou desconhecido
 
-        r_w = ratings.get(w, elo_cfg.base)
-        r_l = ratings.get(l, elo_cfg.base)
+        # --- A. CÁLCULO GLOBAL ---
+        r_w_g = ratings_global.get(w, elo_cfg.base)
+        r_l_g = ratings_global.get(l, elo_cfg.base)
+        w_pre_global.append(r_w_g)
+        l_pre_global.append(r_l_g)
 
-        # Elo pré-jogo
-        w_pre_list.append(r_w)
-        l_pre_list.append(r_l)
+        # Update Global
+        p_w_g = elo_expected(r_w_g, r_l_g)
+        gw_g = games_global.get(w, 0)
+        gl_g = games_global.get(l, 0)
+        k_w_g = elo_cfg.k_new if gw_g < elo_cfg.provisional_games else elo_cfg.k
+        k_l_g = elo_cfg.k_new if gl_g < elo_cfg.provisional_games else elo_cfg.k
+        
+        ratings_global[w] = r_w_g + k_w_g * (1.0 - p_w_g)
+        ratings_global[l] = r_l_g + k_l_g * (0.0 - (1.0 - p_w_g))
+        games_global[w] = gw_g + 1
+        games_global[l] = gl_g + 1
 
-        p_w = elo_expected(r_w, r_l)
-        if elo_cfg.add_prob:
-            prob_w_list.append(p_w)
+        # --- B. CÁLCULO SURFACE ---
+        # Pega o dicionário específico desta superfície
+        r_dict = ratings_surface[surface]
+        g_dict = games_surface[surface]
+        
+        r_w_s = r_dict.get(w, elo_cfg.base)
+        r_l_s = r_dict.get(l, elo_cfg.base)
+        
+        # Salva o Elo desta superfície específica para este jogo
+        w_pre_surf.append(r_w_s)
+        l_pre_surf.append(r_l_s)
 
-        # K adaptativo (provisional)
-        gw = games.get(w, 0)
-        gl = games.get(l, 0)
-        k_w = elo_cfg.k_new if gw < elo_cfg.provisional_games else elo_cfg.k
-        k_l = elo_cfg.k_new if gl < elo_cfg.provisional_games else elo_cfg.k
+        # Update Surface
+        p_w_s = elo_expected(r_w_s, r_l_s)
+        gw_s = g_dict.get(w, 0)
+        gl_s = g_dict.get(l, 0)
+        
+        # K pode ser o mesmo ou específico (usamos o mesmo config por simplicidade)
+        k_w_s = elo_cfg.k_new if gw_s < elo_cfg.provisional_games else elo_cfg.k
+        k_l_s = elo_cfg.k_new if gl_s < elo_cfg.provisional_games else elo_cfg.k
+        
+        r_dict[w] = r_w_s + k_w_s * (1.0 - p_w_s)
+        r_dict[l] = r_l_s + k_l_s * (0.0 - (1.0 - p_w_s))
+        g_dict[w] = gw_s + 1
+        g_dict[l] = gl_s + 1
 
-        # Atualização
-        r_w_new = r_w + k_w * (1.0 - p_w)
-        r_l_new = r_l + k_l * (0.0 - (1.0 - p_w))
-
-        ratings[w] = r_w_new
-        ratings[l] = r_l_new
-        games[w] = gw + 1
-        games[l] = gl + 1
-
-    df["winner_elo_pre"] = w_pre_list
-    df["loser_elo_pre"] = l_pre_list
-    df["elo_diff_wl"] = df["winner_elo_pre"] - df["loser_elo_pre"]
-    if elo_cfg.add_prob:
-        df["winner_elo_prob"] = prob_w_list
+    # Atribui colunas ao DF
+    df["winner_elo_pre"] = w_pre_global
+    df["loser_elo_pre"] = l_pre_global
+    
+    df["winner_elo_surface"] = w_pre_surf
+    df["loser_elo_surface"] = l_pre_surf
 
     return df
 
@@ -180,7 +212,7 @@ def add_basic_features_pairwise(df: pd.DataFrame) -> pd.DataFrame:
         out["p2_rank_missing"] = out["p2_rank"].isna().astype(int)
         out["p1_rank"] = out["p1_rank"].fillna(9999)
         out["p2_rank"] = out["p2_rank"].fillna(9999)
-        out["rank_diff"] = out["p2_rank"] - out["p1_rank"]  # positivo => p1 melhor rankeado
+        out["rank_diff"] = out["p2_rank"] - out["p1_rank"]
 
     # --- Age ---
     if "p1_age" in out.columns and "p2_age" in out.columns:
@@ -190,43 +222,47 @@ def add_basic_features_pairwise(df: pd.DataFrame) -> pd.DataFrame:
         out["p2_age"] = out["p2_age"].fillna(28.0)
         out["age_diff"] = out["p1_age"] - out["p2_age"]
 
-    # --- Elo (diff + prob vectorizado) ---
+    # --- Elo GLOBAL ---
     if "p1_elo_pre" in out.columns and "p2_elo_pre" in out.columns:
         ra = out["p1_elo_pre"].astype(float)
         rb = out["p2_elo_pre"].astype(float)
         out["elo_diff"] = ra - rb
         out["elo_prob_p1"] = 1.0 / (1.0 + 10 ** ((rb - ra) / 400.0))
 
-    # --- Surface ---
+    # --- Elo SURFACE (NOVO) ---
+    # Aqui calculamos a diferença de Elo ESPECÍFICA do piso onde o jogo ocorreu
+    if "p1_elo_surface" in out.columns and "p2_elo_surface" in out.columns:
+        ra_s = out["p1_elo_surface"].astype(float)
+        rb_s = out["p2_elo_surface"].astype(float)
+        out["elo_diff_surface"] = ra_s - rb_s
+        # Probabilidade baseada no piso específico
+        out["elo_prob_surface_p1"] = 1.0 / (1.0 + 10 ** ((rb_s - ra_s) / 400.0))
+
+    # --- Surface Code ---
     if "surface" in out.columns:
         surface_map = {"Hard": 0, "Clay": 1, "Grass": 2, "Carpet": 3}
         out["surface_code"] = out["surface"].map(surface_map).fillna(-1)
 
-    # --- Hand + interação canhoto vs destro ---
+    # --- Hand ---
     if "p1_hand" in out.columns:
         h1 = out["p1_hand"].fillna("U").astype(str).str.upper()
+        out["p1_hand_code"] = h1.map({"R": 0, "L": 1, "U": 2}).fillna(2)
     else:
         h1 = pd.Series(["U"] * len(out), index=out.index)
 
     if "p2_hand" in out.columns:
         h2 = out["p2_hand"].fillna("U").astype(str).str.upper()
+        out["p2_hand_code"] = h2.map({"R": 0, "L": 1, "U": 2}).fillna(2)
     else:
         h2 = pd.Series(["U"] * len(out), index=out.index)
-
-    if "p1_hand" in out.columns:
-        out["p1_hand_code"] = h1.map({"R": 0, "L": 1, "U": 2}).fillna(2)
-    if "p2_hand" in out.columns:
-        out["p2_hand_code"] = h2.map({"R": 0, "L": 1, "U": 2}).fillna(2)
-
+        
     out["is_lefty_vs_righty"] = (((h1 == "L") & (h2 == "R")) | ((h1 == "R") & (h2 == "L"))).astype(int)
 
     # --- Round ---
     if "round" in out.columns:
         round_map = {
             "R128": 1, "R64": 2, "R32": 3, "R16": 4, "QF": 5, "SF": 6, "F": 7,
-            "RR": 8,   # Round Robin
-            "BR": 0,   # Bronze match (raro)
-            "Q1": 0, "Q2": 1, "Q3": 2, "QS": 1  # Qualifiers (heurístico)
+            "RR": 8, "BR": 0, "Q1": 0, "Q2": 1, "Q3": 2, "QS": 1
         }
         out["round_code"] = out["round"].astype(str).str.upper().map(round_map).fillna(1)
 
