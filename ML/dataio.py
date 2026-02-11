@@ -281,4 +281,7 @@ if __name__ == "__main__":
     df = read_range(cfg, 2010, 2012)
     print("Loaded:", df.shape)
     print("Cols (sample):", list(df.columns)[:25])
-    print(df[["date", "winner_id", "loser_id"]].head())
+    """print(df[["date", "winner_id", "loser_id"]].head())"""
+    print("\nPrimeira linha organizada:")
+    print(df.iloc[0].to_string())
+
