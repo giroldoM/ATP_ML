@@ -9,7 +9,8 @@ import numpy as np
 import pandas as pd
 
 # ✅ recomendado: imports relativos dentro do pacote ML
-from .dataio import DataIOConfig, read_range
+from .dataio import DataIOConfig, read_range, drop_leakage_cols
+
 
 
 # ----------------------------
@@ -245,63 +246,45 @@ def build_pairwise_dataset(
     elo_cfg: Optional[EloConfig] = None,
 ) -> pd.DataFrame:
     """
-    Carrega histórico completo -> Calcula Elo -> Gera Features -> Filtra Anos -> LIMPEZA FINAL BLINDADA.
+    Carrega histórico completo -> Calcula Elo (e outras features temporais) ->
+    DROP pós-jogo (score/minutes/w_/l_) -> Gera pairwise -> Features -> Filtra anos -> Drop IDs/metadados.
     """
-    # 1. Carregar SEMPRE desde 2010 para o Elo ter histórico real
-    full_history_start = 2010
-    load_start = min(start_year, full_history_start)
+    # 1) Elo precisa de histórico real desde 2010 (base começa aí)
+    load_start = 2010
 
-    # Carrega range expandido (sem dropar leakage ainda, configurado no dataio)
+    # 2) Carrega sem dropar leakage (data_cfg.drop_leakage=False)
     df_wl = read_range(data_cfg, load_start, end_year)
 
+    # 3) Features temporais (Elo primeiro)
     if elo_cfg is not None:
         df_wl = add_elo_wl(df_wl, elo_cfg)
 
-    # Gera dataset A/B (pairwise)
+    # >>> Se no futuro você fizer rolling stats com w_/l_/minutes, faça AQUI
+    # >>> (e sempre com shift pra ser pré-jogo). Depois disso, continue.
+
+    # 4) Agora sim: remove TUDO que é pós-jogo de forma determinística
+    # (score/minutes + prefixos w_ e l_)
+    df_wl = drop_leakage_cols(df_wl)
+
+    # 5) Pairwise (A/B) e features simples
     df_pw = create_pairwise_data(df_wl)
     df_pw = add_basic_features_pairwise(df_pw)
 
-    # --- FILTRAGEM FINAL DE ANOS ---
-    # Agora sim cortamos para o período que o usuário pediu
+    # 6) Filtra anos finais
     if "date" in df_pw.columns:
-        df_pw["year_temp"] = df_pw["date"].dt.year
-        df_pw = df_pw[(df_pw["year_temp"] >= start_year) & (df_pw["year_temp"] <= end_year)]
-        df_pw = df_pw.drop(columns=["year_temp"])
+        year_temp = df_pw["date"].dt.year
+        df_pw = df_pw[(year_temp >= start_year) & (year_temp <= end_year)]
 
-    # --- REMOÇÃO DE LEAKAGE E METADADOS (VERSÃO SEGURA) ---
-    
-    # 1. Metadados e IDs que causam Overfitting (o modelo decora quem é o jogador)
+    # 7) Drop de IDs/metadados (evita overfit “decorar jogador/torneio”)
     cols_to_drop = {
-        "score", "minutes", "match_num", "tourney_id", "tourney_date",
-        "winner_id", "loser_id", 
-        "p1_id", "p2_id", "p1_name", "p2_name" # CRÍTICO: Remover IDs transformados
+        "match_num", "tourney_id", "tourney_date",
+        "winner_id", "loser_id",
+        "p1_id", "p2_id", "p1_name", "p2_name",
     }
-
-    # 2. Sufixos de estatísticas pós-jogo (Leakage)
-    # Remove qualquer coisa que termine com _ace, _df, etc., seja w_, l_, p1_ ou p2_
-    leakage_suffixes = [
-        "_ace", "_df", "_svpt", "_1stin", "_1stwon", "_2ndwon", 
-        "_svgms", "_bpsaved", "_bpfaced", "_rank_points"
-    ]
-
-    drop_list = list(cols_to_drop)
-    
-    # Varredura final nas colunas
-    for c in df_pw.columns:
-        # Se terminar com sufixo proibido
-        for suffix in leakage_suffixes:
-            if c.endswith(suffix):
-                drop_list.append(c)
-                break 
-        
-        # Se começar com prefixo original de stat (w_ ou l_) e não for ID
-        if c.startswith(("w_", "l_")) and c not in ["w_id", "l_id"]:
-             drop_list.append(c)
-
-    # Executa o drop garantindo que não dê erro se a coluna já não existir
-    df_pw = df_pw.drop(columns=list(set(drop_list)), errors="ignore")
+    df_pw = df_pw.drop(columns=list(cols_to_drop), errors="ignore")
 
     return df_pw
+
 
 
 
