@@ -16,11 +16,15 @@ from .dataio import DataIOConfig, read_range
 # Paths / cfg (pra rodar local)
 # ----------------------------
 
+# Paths / cfg
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 
-# Por padrão: sem leakage no DF (walkover é filtrado antes no dataio)
-cfg = DataIOConfig(data_dir=DATA_DIR, drop_leakage=True, remove_walkovers=True)
+# AJUSTE 1: Mude drop_leakage para False.
+# Motivo: Queremos carregar as stats (aces, minutes) para calcular médias móveis se precisar,
+# e só dropar essas colunas "proibidas" no final do pipeline, antes do treino.
+cfg = DataIOConfig(data_dir=DATA_DIR, drop_leakage=False, remove_walkovers=True)
+
 
 
 # ----------------------------
@@ -149,29 +153,28 @@ def create_pairwise_data(df: pd.DataFrame) -> pd.DataFrame:
 # ----------------------------
 # Features básicas no pairwise
 # ----------------------------
+# Em ML/features.py
 
 def add_basic_features_pairwise(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Cria features simples (diferenças) e algumas codificações.
-    Nota: idealmente, categóricas (surface, hand) ficam cruas e são one-hot no training.
+    Cria features simples (diferenças), codificações e interações (ex: canhoto vs destro).
     """
     out = df.copy()
 
-    # --- Rank / Age (robusto a colunas faltantes) ---
+    # --- Rank / Age ---
     if "p1_rank" in out.columns and "p2_rank" in out.columns:
         out["p1_rank"] = out["p1_rank"].fillna(9999)
         out["p2_rank"] = out["p2_rank"].fillna(9999)
-        out["rank_diff"] = out["p2_rank"] - out["p1_rank"]  # positivo => p1 melhor
+        out["rank_diff"] = out["p2_rank"] - out["p1_rank"]  # positivo => p1 melhor rankeado
 
     if "p1_age" in out.columns and "p2_age" in out.columns:
-        # imputação simples + flags (melhor do que usar mean sem flag)
         out["p1_age_missing"] = out["p1_age"].isna().astype(int)
         out["p2_age_missing"] = out["p2_age"].isna().astype(int)
         out["p1_age"] = out["p1_age"].fillna(28.0)
         out["p2_age"] = out["p2_age"].fillna(28.0)
         out["age_diff"] = out["p1_age"] - out["p2_age"]
 
-    # --- Elo (vem do WL renomeado) ---
+    # --- Elo ---
     if "p1_elo_pre" in out.columns and "p2_elo_pre" in out.columns:
         out["elo_diff"] = out["p1_elo_pre"] - out["p2_elo_pre"]
         out["elo_prob_p1"] = out["p1_elo_pre"].combine(
@@ -179,29 +182,39 @@ def add_basic_features_pairwise(df: pd.DataFrame) -> pd.DataFrame:
             lambda ra, rb: elo_expected(float(ra), float(rb))
         )
 
-    # --- Surface / Hand / Round (opcional codificar aqui) ---
-    # Eu deixaria cru e one-hot no training, mas se vocês quiserem manter código numérico:
+    # --- Surface Code ---
     if "surface" in out.columns:
+        # Hard=0, Clay=1, Grass=2, Carpet=3 (ou use OneHot depois)
         surface_map = {"Hard": 0, "Clay": 1, "Grass": 2, "Carpet": 3}
         out["surface_code"] = out["surface"].map(surface_map).fillna(-1)
 
+    # --- Hand & Matchup (NOVO) ---
+    # Normaliza para R (Right), L (Left), U (Unknown)
+    h1 = out["p1_hand"].fillna("U") if "p1_hand" in out.columns else pd.Series(["U"] * len(out))
+    h2 = out["p2_hand"].fillna("U") if "p2_hand" in out.columns else pd.Series(["U"] * len(out))
+
     if "p1_hand" in out.columns:
-        out["p1_hand"] = out["p1_hand"].fillna("U")
-        out["p1_hand_code"] = out["p1_hand"].map({"R": 0, "L": 1, "U": 2}).fillna(2)
-
+        out["p1_hand_code"] = h1.map({"R": 0, "L": 1, "U": 2}).fillna(2)
     if "p2_hand" in out.columns:
-        out["p2_hand"] = out["p2_hand"].fillna("U")
-        out["p2_hand_code"] = out["p2_hand"].map({"R": 0, "L": 1, "U": 2}).fillna(2)
+        out["p2_hand_code"] = h2.map({"R": 0, "L": 1, "U": 2}).fillna(2)
 
+    # Feature de interação: Jogo é Canhoto vs Destro? (1=Sim, 0=Não)
+    # Isso costuma ser relevante taticamente.
+    # (h1='L' e h2='R') OU (h1='R' e h2='L')
+    is_l_vs_r = ((h1 == "L") & (h2 == "R")) | ((h1 == "R") & (h2 == "L"))
+    out["is_lefty_vs_righty"] = is_l_vs_r.astype(int)
+
+    # --- Round Code ---
     if "round" in out.columns:
         round_map = {
             "F": 7, "SF": 6, "QF": 5,
             "R16": 4, "R32": 3, "R64": 2, "R128": 1,
-            "RR": 0, "BR": 6,
-            # qualifiers comuns
-            "QF": 5, "QS": 1, "Q1": 0, "Q2": 1
+            "RR": 8,  # CORREÇÃO: Round Robin (Finals) vale muito, não 0
+            "BR": 0,  # Bronze match (raro)
+            "QF": 5, "QS": 1, "Q1": 0, "Q2": 1  # Qualifiers
         }
-        out["round_code"] = out["round"].map(round_map).fillna(0)
+        # Mapeia e preenche não encontrados com 1 (assumindo round inicial padrão se falhar)
+        out["round_code"] = out["round"].map(round_map).fillna(1)
 
     return out
 
@@ -209,6 +222,8 @@ def add_basic_features_pairwise(df: pd.DataFrame) -> pd.DataFrame:
 # ----------------------------
 # Pipeline “oficial” de features
 # ----------------------------
+
+# Em ML/features.py
 
 def build_pairwise_dataset(
     start_year: int,
@@ -218,15 +233,48 @@ def build_pairwise_dataset(
     elo_cfg: Optional[EloConfig] = None,
 ) -> pd.DataFrame:
     """
-    Carrega WL -> (opcional Elo) -> duplica -> features básicas.
+    Carrega WL -> (opcional Elo) -> duplica -> features básicas -> LIMPEZA FINAL.
     """
-    df_wl = read_range(data_cfg, start_year, end_year)
+    # DICA DE OURO: Sempre carregue desde 2010 (ou antes) para o Elo "pegar tração".
+    # Se carregar só 2023-2024, o Elo começa frio (1500) em 2023, o que é ruim.
+    # Carregamos tudo, calculamos features, e DEPOIS filtramos os anos pedidos.
+    full_start = 2010  # ou o ano min do seu dataset
+    df_wl = read_range(data_cfg, full_start, end_year)
 
     if elo_cfg is not None:
         df_wl = add_elo_wl(df_wl, elo_cfg)
+    
+    # Aqui entrariam outras funções de features em W/L (ex: Rolling Stats de Aces/BreakPoints)
+    # ...
 
     df_pw = create_pairwise_data(df_wl)
     df_pw = add_basic_features_pairwise(df_pw)
+
+    # --- FILTRAGEM FINAL DE ANOS ---
+    # Agora sim cortamos para o período que o usuário pediu (ex: treino 2015-2023)
+    df_pw["year"] = df_pw["date"].dt.year
+    df_pw = df_pw[(df_pw["year"] >= start_year) & (df_pw["year"] <= end_year)].copy()
+
+    # --- REMOÇÃO DE LEAKAGE (FINAL) ---
+    # Como desligamos o drop_leakage=False na config para poder calcular features,
+    # agora precisamos limpar a sujeira (stats pós-jogo) para não vazar no treino.
+    # Lista de colunas perigosas típicas do ATP (adapte se tiver mais):
+    leakage_cols = [
+        "score", "minutes", "match_num", "winner_id", "loser_id",
+        "w_ace", "w_df", "w_svpt", "w_1stin", "w_1stwon", "w_2ndwon", "w_svgms", "w_bpsaved", "w_bpfaced",
+        "l_ace", "l_df", "l_svpt", "l_1stin", "l_1stwon", "l_2ndwon", "l_svgms", "l_bpsaved", "l_bpfaced",
+        "winner_rank_points", "loser_rank_points" # pontos do ranking as vezes vazam futuro dependendo da fonte
+    ]
+    # Remove também as versões "p1_" e "p2_" dessas stats que o pairwise criou
+    cols_to_drop = []
+    for c in df_pw.columns:
+        # Se for coluna de leakage crua ou transformada (ex: p1_ace)
+        base_name = c.replace("p1_", "").replace("p2_", "").replace("winner_", "").replace("loser_", "")
+        if base_name in leakage_cols or c in leakage_cols:
+            cols_to_drop.append(c)
+    
+    df_pw = df_pw.drop(columns=cols_to_drop, errors="ignore")
+
     return df_pw
 
 

@@ -104,18 +104,27 @@ def read_range(cfg: DataIOConfig, start_year: int, end_year: int) -> pd.DataFram
 
 def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalize column names and ensure basic types that are frequently problematic.
-    - Lowercase column names
-    - Strip whitespace
-    - Keep tourney_date as string-like (needed for parsing YYYYMMDD)
+    Normalize column names and ensure basic types.
+    - Lowercase column names, strip whitespace.
+    - Keep tourney_date as string.
+    - Force numeric types for ranks, ages, heights (handling 'NR' or strings).
     """
     df = df.copy()
     df.columns = df.columns.str.strip().str.lower()
 
     # Make sure tourney_date is present before referencing
     if "tourney_date" in df.columns:
-        # Some files store as int (YYYYMMDD). Converting to string is safest.
         df["tourney_date"] = df["tourney_date"].astype(str).str.strip()
+
+    # CORREÇÃO CRÍTICA: Forçar conversão numérica para evitar erros com strings "NR" ou nulos
+    cols_to_numeric = [
+        "winner_rank", "loser_rank", 
+        "winner_age", "loser_age", 
+        "winner_ht", "loser_ht"
+    ]
+    for c in cols_to_numeric:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
     return df
 
@@ -251,23 +260,26 @@ def sort_matches(df: pd.DataFrame) -> pd.DataFrame:
     """
     Sort deterministically:
     - by date ascending
-    - then by match_num if present (common in ATP datasets)
-    - else by tourney_id if present
+    - then by tourney_id (agrupa o torneio)
+    - then by match_num (CRÍTICO: garante ordem correta R1 -> Final dentro do torneio)
     - else stable by winner_id/loser_id
     """
     df = df.copy()
 
+    # Ordem de prioridade para evitar leakage intra-torneio
     sort_cols = ["date"]
-    for c in OPTIONAL_ORDER_COLS:
-        if c in df.columns:
-            sort_cols.append(c)
+    
+    # Se tivermos tourney_id e match_num, eles são a verdade absoluta da ordem
+    if "tourney_id" in df.columns:
+        sort_cols.append("tourney_id")
+    if "match_num" in df.columns:
+        sort_cols.append("match_num")
 
-    # Fallback stable cols
+    # Fallback stable cols (caso falte match_num, o que é raro em ATP oficial)
     for c in ("winner_id", "loser_id"):
         if c in df.columns and c not in sort_cols:
             sort_cols.append(c)
 
-    # Some sort cols may be non-numeric strings; that's OK.
     df = df.sort_values(sort_cols, ascending=True, kind="mergesort").reset_index(drop=True)
     return df
 
