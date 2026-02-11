@@ -1,155 +1,250 @@
-import pandas as pd
-import numpy as np
-from pathlib import Path
-from dataio import DataIOConfig, read_range
+# ML/features.py
+from __future__ import annotations
 
-# --- CONFIGURATION ---
-# 1. Get the location of this file (features.py) -> .../ATP_ML/ML
-# 2. Go up two levels (.parent.parent) -> .../ATP_ML
-# 3. Enter the data folder -> .../ATP_ML/data
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+
+# ✅ recomendado: imports relativos dentro do pacote ML
+from .dataio import DataIOConfig, read_range
+
+
+# ----------------------------
+# Paths / cfg (pra rodar local)
+# ----------------------------
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 
-# We keep drop_leakage=False for now to access 'score' if needed for feature engineering,
-# but we must be careful to drop it before training.
-cfg = DataIOConfig(data_dir=DATA_DIR, drop_leakage=False)
+# Por padrão: sem leakage no DF (walkover é filtrado antes no dataio)
+cfg = DataIOConfig(data_dir=DATA_DIR, drop_leakage=True, remove_walkovers=True)
 
-def create_pairwise_data(df: pd.DataFrame) -> pd.DataFrame:
+
+# ----------------------------
+# Elo config + helpers
+# ----------------------------
+
+@dataclass(frozen=True)
+class EloConfig:
+    base: float = 1500.0
+    k: float = 32.0
+    k_new: float = 64.0
+    provisional_games: int = 10
+    add_prob: bool = True  # cria elo_prob_* também
+
+
+def elo_expected(r_a: float, r_b: float) -> float:
+    return 1.0 / (1.0 + 10 ** ((r_b - r_a) / 400.0))
+
+
+def add_elo_wl(df_wl: pd.DataFrame, elo_cfg: EloConfig) -> pd.DataFrame:
     """
-    Transforms the dataset from (Winner, Loser) format to (Player1, Player2) format.
-    
-    This doubles the dataset size:
-    - Row 1: P1 = Winner, P2 = Loser, Target = 1
-    - Row 2: P1 = Loser, P2 = Winner, Target = 0
-    
-    Returns:
-        pd.DataFrame: A dataframe ready for training with 'target' column.
+    Calcula Elo PRÉ-JOGO em df winner/loser (1 linha por match),
+    atualizando o rating UMA vez por partida (sem duplicação).
+
+    Requer colunas: date, winner_id, loser_id.
+    (o dataio já garante date e ids, e já ordena; mesmo assim, reforçamos sort por segurança)
     """
-    print("🔄 Reformatting data to Player1 vs Player2 structure...")
-    
-    # 1. Create the "Positive" samples (Player 1 is the Winner)
-    # We rename columns starting with 'winner_' to 'p1_' and 'loser_' to 'p2_'
-    df_pos = df.copy()
-    cols_pos = {c: c.replace('winner_', 'p1_').replace('loser_', 'p2_') 
-                for c in df_pos.columns if 'winner_' in c or 'loser_' in c}
-    df_pos = df_pos.rename(columns=cols_pos)
-    df_pos['target'] = 1  # Player 1 won
+    df = df_wl.copy()
 
-    # 2. Create the "Negative" samples (Player 1 is the Loser)
-    # We rename columns starting with 'loser_' to 'p1_' and 'winner_' to 'p2_'
-    df_neg = df.copy()
-    cols_neg = {c: c.replace('loser_', 'p1_').replace('winner_', 'p2_') 
-                for c in df_neg.columns if 'winner_' in c or 'loser_' in c}
-    df_neg = df_neg.rename(columns=cols_neg)
-    df_neg['target'] = 0  # Player 1 lost (Player 2 won)
+    # Ordenação defensiva (dataio já faz isso)
+    sort_cols = ["date"]
+    if "match_num" in df.columns:
+        sort_cols.append("match_num")
+    df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
 
-    # 3. Combine both dataframes
-    df_pairwise = pd.concat([df_pos, df_neg], axis=0, ignore_index=True)
-    
-    # 4. Sort by date to maintain temporal integrity (crucial for time-series splits)
-    if 'date' in df_pairwise.columns:
-        df_pairwise = df_pairwise.sort_values(by=['date', 'match_num']).reset_index(drop=True)
-        
-    return df_pairwise
+    ratings: Dict[int, float] = {}
+    games: Dict[int, int] = {}
 
-def add_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adds predictive features (Math & Statistics) to the dataset.
-    """
-    print("🛠️  Engineering features (Ranks, Age, Surface, Round)...")
-    df = df.copy()
+    w_pre_list = []
+    l_pre_list = []
+    prob_w_list = []
 
-    # --- 1. Handle Missing Values (Null Ranks) ---
-    # If a player has no rank, we give them a very low rank (e.g., 9999)
-    df['p1_rank'] = df['p1_rank'].fillna(9999)
-    df['p2_rank'] = df['p2_rank'].fillna(9999)
-    
-    # Fill missing ages with the mean age of all players
-    df['p1_age'] = df['p1_age'].fillna(df['p1_age'].mean())
-    df['p2_age'] = df['p2_age'].fillna(df['p2_age'].mean())
+    for _, row in df.iterrows():
+        w = int(row["winner_id"])
+        l = int(row["loser_id"])
 
-    # --- 2. Create Diff Features ---
-    # Rank Diff: Positive means P1 has a BETTER (lower) rank than P2
-    # Logic: If P1 is Rank 1 and P2 is Rank 100 -> P2(100) - P1(1) = 99 (Positive = P1 Favorite)
-    df['rank_diff'] = df['p2_rank'] - df['p1_rank']
-    
-    # Age Diff: P1 age - P2 age
-    df['age_diff'] = df['p1_age'] - df['p2_age']
+        r_w = ratings.get(w, elo_cfg.base)
+        r_l = ratings.get(l, elo_cfg.base)
 
-    # --- 3. Encode Categorical Data (Text -> Numbers) ---
-    # Surface: Hard=0, Clay=1, Grass=2, Carpet=3
-    surface_map = {'Hard': 0, 'Clay': 1, 'Grass': 2, 'Carpet': 3}
-    df['surface_code'] = df['surface'].map(surface_map).fillna(-1)
+        # Elo pré-jogo
+        w_pre_list.append(r_w)
+        l_pre_list.append(r_l)
 
-    # Hand: R=0, L=1, U=2 (Unknown)
-    df['p1_hand_code'] = df['p1_hand'].map({'R': 0, 'L': 1, 'U': 2}).fillna(0)
-    df['p2_hand_code'] = df['p2_hand'].map({'R': 0, 'L': 1, 'U': 2}).fillna(0)
+        # Probabilidade (opcional)
+        p_w = elo_expected(r_w, r_l)
+        if elo_cfg.add_prob:
+            prob_w_list.append(p_w)
 
-    # --- 4. Round Encoding (Hierarchy of Importance) ---
-    # We assign higher values to later rounds
-    round_map = {
-        'F': 7,      # Final (Most important)
-        'SF': 6,     # Semi-Final
-        'QF': 5,     # Quarter-Finals
-        'R16': 4,    # Round of 16
-        'R32': 3,    # Round of 32
-        'R64': 2,    # Round of 64
-        'R128': 1,   # Round of 128 (First round)
-        'RR': 0,     # Round Robin / Others
-        'BR': 6      # Bronze Medal (Olympics) - equivalent to Semi
-    }
-    # Map text to numbers. fillna(0) handles rare cases.
-    df['round_code'] = df['round'].map(round_map).fillna(0)
+        # K adaptativo para novatos (provisional)
+        gw = games.get(w, 0)
+        gl = games.get(l, 0)
+        k_w = elo_cfg.k_new if gw < elo_cfg.provisional_games else elo_cfg.k
+        k_l = elo_cfg.k_new if gl < elo_cfg.provisional_games else elo_cfg.k
+
+        # Atualiza (winner score=1, loser score=0)
+        # Se k_w != k_l, atualiza separadamente (normal)
+        r_w_new = r_w + k_w * (1.0 - p_w)
+        r_l_new = r_l + k_l * (0.0 - (1.0 - p_w))
+
+        ratings[w] = r_w_new
+        ratings[l] = r_l_new
+        games[w] = gw + 1
+        games[l] = gl + 1
+
+    df["winner_elo_pre"] = w_pre_list
+    df["loser_elo_pre"] = l_pre_list
+    df["elo_diff_wl"] = df["winner_elo_pre"] - df["loser_elo_pre"]
+    if elo_cfg.add_prob:
+        df["winner_elo_prob"] = prob_w_list
 
     return df
 
-def prepare_for_model(df: pd.DataFrame):
-    """
-    Selects only the columns that the model can see.
-    Removes names, dates, scores, and IDs.
-    """
-    # List of features we created + some basics
-    features = [
-        'rank_diff', 'age_diff', 
-        'p1_rank', 'p2_rank', 
-        'p1_age', 'p2_age',
-        'surface_code', 'p1_hand_code', 'p2_hand_code',
-        'round_code' # Using the encoded round
-    ]
-    
-    # Check which features actually exist in df (safety check)
-    available_features = [f for f in features if f in df.columns]
-    
-    X = df[available_features]
-    y = df['target']
-    
-    return X, y
 
-# --- MAIN EXECUTION ---
+# ----------------------------
+# Winner/Loser -> P1/P2 (duplica)
+# ----------------------------
+
+def create_pairwise_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Dobra o dataset:
+      - positivo: P1=winner, P2=loser, target=1
+      - negativo: P1=loser, P2=winner, target=0
+
+    ⚠️ IMPORTANTE:
+    - Features temporais (Elo, forma recente, H2H etc.) devem ser calculadas ANTES.
+    """
+    df_pos = df.copy()
+    cols_pos = {
+        c: c.replace("winner_", "p1_").replace("loser_", "p2_")
+        for c in df_pos.columns
+        if ("winner_" in c) or ("loser_" in c)
+    }
+    df_pos = df_pos.rename(columns=cols_pos)
+    df_pos["target"] = 1
+
+    df_neg = df.copy()
+    cols_neg = {
+        c: c.replace("loser_", "p1_").replace("winner_", "p2_")
+        for c in df_neg.columns
+        if ("winner_" in c) or ("loser_" in c)
+    }
+    df_neg = df_neg.rename(columns=cols_neg)
+    df_neg["target"] = 0
+
+    df_pairwise = pd.concat([df_pos, df_neg], ignore_index=True)
+
+    # Ordenação segura (date sempre existe)
+    sort_cols = ["date"]
+    if "match_num" in df_pairwise.columns:
+        sort_cols.append("match_num")
+    df_pairwise = df_pairwise.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+
+    return df_pairwise
+
+
+# ----------------------------
+# Features básicas no pairwise
+# ----------------------------
+
+def add_basic_features_pairwise(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Cria features simples (diferenças) e algumas codificações.
+    Nota: idealmente, categóricas (surface, hand) ficam cruas e são one-hot no training.
+    """
+    out = df.copy()
+
+    # --- Rank / Age (robusto a colunas faltantes) ---
+    if "p1_rank" in out.columns and "p2_rank" in out.columns:
+        out["p1_rank"] = out["p1_rank"].fillna(9999)
+        out["p2_rank"] = out["p2_rank"].fillna(9999)
+        out["rank_diff"] = out["p2_rank"] - out["p1_rank"]  # positivo => p1 melhor
+
+    if "p1_age" in out.columns and "p2_age" in out.columns:
+        # imputação simples + flags (melhor do que usar mean sem flag)
+        out["p1_age_missing"] = out["p1_age"].isna().astype(int)
+        out["p2_age_missing"] = out["p2_age"].isna().astype(int)
+        out["p1_age"] = out["p1_age"].fillna(28.0)
+        out["p2_age"] = out["p2_age"].fillna(28.0)
+        out["age_diff"] = out["p1_age"] - out["p2_age"]
+
+    # --- Elo (vem do WL renomeado) ---
+    if "p1_elo_pre" in out.columns and "p2_elo_pre" in out.columns:
+        out["elo_diff"] = out["p1_elo_pre"] - out["p2_elo_pre"]
+        out["elo_prob_p1"] = out["p1_elo_pre"].combine(
+            out["p2_elo_pre"],
+            lambda ra, rb: elo_expected(float(ra), float(rb))
+        )
+
+    # --- Surface / Hand / Round (opcional codificar aqui) ---
+    # Eu deixaria cru e one-hot no training, mas se vocês quiserem manter código numérico:
+    if "surface" in out.columns:
+        surface_map = {"Hard": 0, "Clay": 1, "Grass": 2, "Carpet": 3}
+        out["surface_code"] = out["surface"].map(surface_map).fillna(-1)
+
+    if "p1_hand" in out.columns:
+        out["p1_hand"] = out["p1_hand"].fillna("U")
+        out["p1_hand_code"] = out["p1_hand"].map({"R": 0, "L": 1, "U": 2}).fillna(2)
+
+    if "p2_hand" in out.columns:
+        out["p2_hand"] = out["p2_hand"].fillna("U")
+        out["p2_hand_code"] = out["p2_hand"].map({"R": 0, "L": 1, "U": 2}).fillna(2)
+
+    if "round" in out.columns:
+        round_map = {
+            "F": 7, "SF": 6, "QF": 5,
+            "R16": 4, "R32": 3, "R64": 2, "R128": 1,
+            "RR": 0, "BR": 6,
+            # qualifiers comuns
+            "QF": 5, "QS": 1, "Q1": 0, "Q2": 1
+        }
+        out["round_code"] = out["round"].map(round_map).fillna(0)
+
+    return out
+
+
+# ----------------------------
+# Pipeline “oficial” de features
+# ----------------------------
+
+def build_pairwise_dataset(
+    start_year: int,
+    end_year: int,
+    *,
+    data_cfg: DataIOConfig,
+    elo_cfg: Optional[EloConfig] = None,
+) -> pd.DataFrame:
+    """
+    Carrega WL -> (opcional Elo) -> duplica -> features básicas.
+    """
+    df_wl = read_range(data_cfg, start_year, end_year)
+
+    if elo_cfg is not None:
+        df_wl = add_elo_wl(df_wl, elo_cfg)
+
+    df_pw = create_pairwise_data(df_wl)
+    df_pw = add_basic_features_pairwise(df_pw)
+    return df_pw
+
+
+# ----------------------------
+# Teste manual
+# ----------------------------
+
 if __name__ == "__main__":
-    print(f"📂 Loading data from: {DATA_DIR}")
+    print(f"📂 DATA_DIR = {DATA_DIR}")
 
-    try:
-        # 1. Load Data (Using a larger range for a proper test: 2015-2023)
-        df_raw = read_range(cfg, 2015, 2023)
-        print(f"✅ Raw Data Loaded: {df_raw.shape[0]} matches.")
+    elo_cfg = EloConfig(base=1500.0, k=32.0, k_new=64.0, provisional_games=10, add_prob=True)
 
-        # 2. Structure (Winner/Loser -> Player1/Player2)
-        df_pairwise = create_pairwise_data(df_raw)
-        
-        # 3. Add Features (Math & Encodings)
-        # We pass df_pairwise to the function for clarity
-        df_rich = add_features(df_pairwise)
-        
-        # 4. Cleanup for Model
-        X, y = prepare_for_model(df_rich)
-        
-        print("\n✅ READY FOR TRAINING!")
-        print(f"Features Matrix (X): {X.shape}")
-        print(f"Target Vector (y):   {y.shape}")
-        
-        print("\n--- Example of Model Input (First 5 rows) ---")
-        print(X.head())
+    df_pw = build_pairwise_dataset(
+        2015, 2023,
+        data_cfg=cfg,
+        elo_cfg=elo_cfg
+    )
 
-    except Exception as e:
-        print(f"❌ ERROR: {e}")
+    print("✅ Pairwise pronto:", df_pw.shape)
+    cols_show = [c for c in ["date","p1_id","p2_id","target","elo_diff","elo_prob_p1","rank_diff","age_diff","surface"] if c in df_pw.columns]
+    print(df_pw[cols_show].head(10))
