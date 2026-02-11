@@ -102,32 +102,35 @@ def read_range(cfg: DataIOConfig, start_year: int, end_year: int) -> pd.DataFram
 # Helpers: standardize + validate
 # ----------------------------
 
+
 def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Normalize column names and ensure basic types.
     - Lowercase column names, strip whitespace.
     - Keep tourney_date as string.
-    - Force numeric types for ranks, ages, heights (handling 'NR' or strings).
+    - Force numeric types for ranks, ages, heights, match_num, ids (handling 'NR' or strings).
     """
     df = df.copy()
     df.columns = df.columns.str.strip().str.lower()
 
-    # Make sure tourney_date is present before referencing
+    # tourney_date as string
     if "tourney_date" in df.columns:
         df["tourney_date"] = df["tourney_date"].astype(str).str.strip()
 
-    # CORREÇÃO CRÍTICA: Forçar conversão numérica e incluir match_num para ordenação correta
+    # numeric conversions (robusto)
     cols_to_numeric = [
-        "winner_rank", "loser_rank", 
-        "winner_age", "loser_age", 
+        "winner_id", "loser_id",
+        "winner_rank", "loser_rank",
+        "winner_age", "loser_age",
         "winner_ht", "loser_ht",
-        "match_num"  # Essencial: garante que 1 < 2 < 10 (texto faria 1 < 10 < 2)
+        "match_num",
     ]
     for c in cols_to_numeric:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
     return df
+
 
 
 def ensure_required_cols(df: pd.DataFrame, required: Iterable[str], context: str = "") -> None:
@@ -172,6 +175,7 @@ def parse_date(df: pd.DataFrame) -> pd.DataFrame:
 # Helpers: row filtering
 # ----------------------------
 
+
 def filter_basic_rows(df: pd.DataFrame, *, remove_walkovers: bool) -> pd.DataFrame:
     """
     Remove invalid rows:
@@ -181,20 +185,22 @@ def filter_basic_rows(df: pd.DataFrame, *, remove_walkovers: bool) -> pd.DataFra
     """
     df = df.copy()
 
-    # Winner/Loser ids must exist
     df = df.dropna(subset=["winner_id", "loser_id"])
-
-    # Remove impossible self-matches
     df = df[df["winner_id"] != df["loser_id"]]
 
-    # Optional: remove walkovers if score exists
     if remove_walkovers and "score" in df.columns:
         score = df["score"].astype(str).str.upper()
-        # Common markers: "W/O", "WO", "WALKOVER"
-        is_wo = score.str.contains("W/O", na=False) | score.str.contains("WALKOVER", na=False)
+
+        # pega W/O, WO, WALKOVER (WO simples acontece)
+        is_wo = (
+            score.str.contains(r"\bW/O\b", na=False, regex=True)
+            | score.str.contains(r"\bWO\b", na=False, regex=True)
+            | score.str.contains("WALKOVER", na=False)
+        )
         df = df[~is_wo]
 
     return df
+
 
 
 def filter_only_singles_if_possible(df: pd.DataFrame) -> pd.DataFrame:

@@ -44,22 +44,25 @@ def elo_expected(r_a: float, r_b: float) -> float:
     return 1.0 / (1.0 + 10 ** ((r_b - r_a) / 400.0))
 
 
+# ----------------------------
+# Features: add_elo_wl (ajustada)
+# ----------------------------
 def add_elo_wl(df_wl: pd.DataFrame, elo_cfg: EloConfig) -> pd.DataFrame:
     """
     Calcula Elo PRÉ-JOGO em df winner/loser (1 linha por match),
     atualizando o rating UMA vez por partida (sem duplicação).
 
     Requer colunas: date, winner_id, loser_id.
-    (o dataio já garante date e ids, e já ordena; mesmo assim, reforçamos sort por segurança)
     """
     df = df_wl.copy()
 
-    # Ordenação defensiva (dataio já faz isso)
+    # Ordenação defensiva + determinística (inclui tourney_id se existir)
     sort_cols = ["date"]
-if "tourney_id" in df.columns: sort_cols.append("tourney_id")
-if "match_num" in df.columns: sort_cols.append("match_num")
-df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
-
+    if "tourney_id" in df.columns:
+        sort_cols.append("tourney_id")
+    if "match_num" in df.columns:
+        sort_cols.append("match_num")
+    df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
 
     ratings: Dict[int, float] = {}
     games: Dict[int, int] = {}
@@ -68,9 +71,11 @@ df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
     l_pre_list = []
     prob_w_list = []
 
-    for _, row in df.iterrows():
-        w = int(row["winner_id"])
-        l = int(row["loser_id"])
+    # itertuples é MUITO mais rápido que iterrows
+    for row in df.itertuples(index=False):
+        # ids podem vir como float (ex: 123.0), então força int via float()
+        w = int(float(getattr(row, "winner_id")))
+        l = int(float(getattr(row, "loser_id")))
 
         r_w = ratings.get(w, elo_cfg.base)
         r_l = ratings.get(l, elo_cfg.base)
@@ -79,19 +84,17 @@ df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
         w_pre_list.append(r_w)
         l_pre_list.append(r_l)
 
-        # Probabilidade (opcional)
         p_w = elo_expected(r_w, r_l)
         if elo_cfg.add_prob:
             prob_w_list.append(p_w)
 
-        # K adaptativo para novatos (provisional)
+        # K adaptativo (provisional)
         gw = games.get(w, 0)
         gl = games.get(l, 0)
         k_w = elo_cfg.k_new if gw < elo_cfg.provisional_games else elo_cfg.k
         k_l = elo_cfg.k_new if gl < elo_cfg.provisional_games else elo_cfg.k
 
-        # Atualiza (winner score=1, loser score=0)
-        # Se k_w != k_l, atualiza separadamente (normal)
+        # Atualização
         r_w_new = r_w + k_w * (1.0 - p_w)
         r_l_new = r_l + k_l * (0.0 - (1.0 - p_w))
 
@@ -109,24 +112,27 @@ df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
     return df
 
 
+
 # ----------------------------
 # Winner/Loser -> P1/P2 (duplica)
 # ----------------------------
 
+# ----------------------------
+# Features: create_pairwise_data (ajustada)
+# ----------------------------
 def create_pairwise_data(df: pd.DataFrame) -> pd.DataFrame:
     """
     Dobra o dataset:
       - positivo: P1=winner, P2=loser, target=1
       - negativo: P1=loser, P2=winner, target=0
 
-    ⚠️ IMPORTANTE:
-    - Features temporais (Elo, forma recente, H2H etc.) devem ser calculadas ANTES.
+    ⚠️ Features temporais (Elo, forma recente, H2H etc.) devem ser calculadas ANTES.
     """
     df_pos = df.copy()
     cols_pos = {
         c: c.replace("winner_", "p1_").replace("loser_", "p2_")
         for c in df_pos.columns
-        if ("winner_" in c) or ("loser_" in c)
+        if (c.startswith("winner_") or c.startswith("loser_"))
     }
     df_pos = df_pos.rename(columns=cols_pos)
     df_pos["target"] = 1
@@ -135,20 +141,22 @@ def create_pairwise_data(df: pd.DataFrame) -> pd.DataFrame:
     cols_neg = {
         c: c.replace("loser_", "p1_").replace("winner_", "p2_")
         for c in df_neg.columns
-        if ("winner_" in c) or ("loser_" in c)
+        if (c.startswith("winner_") or c.startswith("loser_"))
     }
     df_neg = df_neg.rename(columns=cols_neg)
     df_neg["target"] = 0
 
     df_pairwise = pd.concat([df_pos, df_neg], ignore_index=True)
 
-    # Ordenação segura (date sempre existe)
     sort_cols = ["date"]
+    if "tourney_id" in df_pairwise.columns:
+        sort_cols.append("tourney_id")
     if "match_num" in df_pairwise.columns:
         sort_cols.append("match_num")
-    df_pairwise = df_pairwise.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
 
+    df_pairwise = df_pairwise.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
     return df_pairwise
+
 
 
 # ----------------------------
@@ -156,18 +164,24 @@ def create_pairwise_data(df: pd.DataFrame) -> pd.DataFrame:
 # ----------------------------
 # Em ML/features.py
 
+# ----------------------------
+# Features: add_basic_features_pairwise (ajustada)
+# ----------------------------
 def add_basic_features_pairwise(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Cria features simples (diferenças), codificações e interações (ex: canhoto vs destro).
+    Cria features simples (diferenças), flags de missing e encodings básicos.
     """
     out = df.copy()
 
-    # --- Rank / Age ---
+    # --- Rank ---
     if "p1_rank" in out.columns and "p2_rank" in out.columns:
+        out["p1_rank_missing"] = out["p1_rank"].isna().astype(int)
+        out["p2_rank_missing"] = out["p2_rank"].isna().astype(int)
         out["p1_rank"] = out["p1_rank"].fillna(9999)
         out["p2_rank"] = out["p2_rank"].fillna(9999)
         out["rank_diff"] = out["p2_rank"] - out["p1_rank"]  # positivo => p1 melhor rankeado
 
+    # --- Age ---
     if "p1_age" in out.columns and "p2_age" in out.columns:
         out["p1_age_missing"] = out["p1_age"].isna().astype(int)
         out["p2_age_missing"] = out["p2_age"].isna().astype(int)
@@ -175,49 +189,48 @@ def add_basic_features_pairwise(df: pd.DataFrame) -> pd.DataFrame:
         out["p2_age"] = out["p2_age"].fillna(28.0)
         out["age_diff"] = out["p1_age"] - out["p2_age"]
 
-    # --- Elo ---
+    # --- Elo (diff + prob vectorizado) ---
     if "p1_elo_pre" in out.columns and "p2_elo_pre" in out.columns:
-        out["elo_diff"] = out["p1_elo_pre"] - out["p2_elo_pre"]
-        out["elo_prob_p1"] = out["p1_elo_pre"].combine(
-            out["p2_elo_pre"],
-            lambda ra, rb: elo_expected(float(ra), float(rb))
-        )
+        ra = out["p1_elo_pre"].astype(float)
+        rb = out["p2_elo_pre"].astype(float)
+        out["elo_diff"] = ra - rb
+        out["elo_prob_p1"] = 1.0 / (1.0 + 10 ** ((rb - ra) / 400.0))
 
-    # --- Surface Code ---
+    # --- Surface ---
     if "surface" in out.columns:
-        # Hard=0, Clay=1, Grass=2, Carpet=3 (ou use OneHot depois)
         surface_map = {"Hard": 0, "Clay": 1, "Grass": 2, "Carpet": 3}
         out["surface_code"] = out["surface"].map(surface_map).fillna(-1)
 
-    # --- Hand & Matchup (NOVO) ---
-    # Normaliza para R (Right), L (Left), U (Unknown)
-    h1 = out["p1_hand"].fillna("U") if "p1_hand" in out.columns else pd.Series(["U"] * len(out))
-    h2 = out["p2_hand"].fillna("U") if "p2_hand" in out.columns else pd.Series(["U"] * len(out))
+    # --- Hand + interação canhoto vs destro ---
+    if "p1_hand" in out.columns:
+        h1 = out["p1_hand"].fillna("U").astype(str).str.upper()
+    else:
+        h1 = pd.Series(["U"] * len(out), index=out.index)
+
+    if "p2_hand" in out.columns:
+        h2 = out["p2_hand"].fillna("U").astype(str).str.upper()
+    else:
+        h2 = pd.Series(["U"] * len(out), index=out.index)
 
     if "p1_hand" in out.columns:
         out["p1_hand_code"] = h1.map({"R": 0, "L": 1, "U": 2}).fillna(2)
     if "p2_hand" in out.columns:
         out["p2_hand_code"] = h2.map({"R": 0, "L": 1, "U": 2}).fillna(2)
 
-    # Feature de interação: Jogo é Canhoto vs Destro? (1=Sim, 0=Não)
-    # Isso costuma ser relevante taticamente.
-    # (h1='L' e h2='R') OU (h1='R' e h2='L')
-    is_l_vs_r = ((h1 == "L") & (h2 == "R")) | ((h1 == "R") & (h2 == "L"))
-    out["is_lefty_vs_righty"] = is_l_vs_r.astype(int)
+    out["is_lefty_vs_righty"] = (((h1 == "L") & (h2 == "R")) | ((h1 == "R") & (h2 == "L"))).astype(int)
 
-    # --- Round Code ---
+    # --- Round ---
     if "round" in out.columns:
         round_map = {
-            "F": 7, "SF": 6, "QF": 5,
-            "R16": 4, "R32": 3, "R64": 2, "R128": 1,
-            "RR": 8,  # CORREÇÃO: Round Robin (Finals) vale muito, não 0
-            "BR": 0,  # Bronze match (raro)
-            "QF": 5, "QS": 1, "Q1": 0, "Q2": 1  # Qualifiers
+            "R128": 1, "R64": 2, "R32": 3, "R16": 4, "QF": 5, "SF": 6, "F": 7,
+            "RR": 8,   # Round Robin
+            "BR": 0,   # Bronze match (raro)
+            "Q1": 0, "Q2": 1, "Q3": 2, "QS": 1  # Qualifiers (heurístico)
         }
-        # Mapeia e preenche não encontrados com 1 (assumindo round inicial padrão se falhar)
-        out["round_code"] = out["round"].map(round_map).fillna(1)
+        out["round_code"] = out["round"].astype(str).str.upper().map(round_map).fillna(1)
 
     return out
+
 
 
 # ----------------------------
