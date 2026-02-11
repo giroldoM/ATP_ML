@@ -116,11 +116,12 @@ def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
     if "tourney_date" in df.columns:
         df["tourney_date"] = df["tourney_date"].astype(str).str.strip()
 
-    # CORREÇÃO CRÍTICA: Forçar conversão numérica para evitar erros com strings "NR" ou nulos
+    # CORREÇÃO CRÍTICA: Forçar conversão numérica e incluir match_num para ordenação correta
     cols_to_numeric = [
         "winner_rank", "loser_rank", 
         "winner_age", "loser_age", 
-        "winner_ht", "loser_ht"
+        "winner_ht", "loser_ht",
+        "match_num"  # Essencial: garante que 1 < 2 < 10 (texto faria 1 < 10 < 2)
     ]
     for c in cols_to_numeric:
         if c in df.columns:
