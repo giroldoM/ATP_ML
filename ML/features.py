@@ -56,9 +56,10 @@ def add_elo_wl(df_wl: pd.DataFrame, elo_cfg: EloConfig) -> pd.DataFrame:
 
     # Ordenação defensiva (dataio já faz isso)
     sort_cols = ["date"]
-    if "match_num" in df.columns:
-        sort_cols.append("match_num")
-    df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+if "tourney_id" in df.columns: sort_cols.append("tourney_id")
+if "match_num" in df.columns: sort_cols.append("match_num")
+df = df.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
+
 
     ratings: Dict[int, float] = {}
     games: Dict[int, int] = {}
