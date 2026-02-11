@@ -27,20 +27,26 @@ class TrainConfig:
     target_col: str = "target"
     random_state: int = 42
     
-    # 🚫 LISTA NEGRA: Colunas que JAMAIS podem entrar no treino
-    # Inclui metadados, texto e estatísticas pós-jogo (leakage)
+    # 🚫 LISTA NEGRA ATUALIZADA
     drop_cols: Tuple[str, ...] = (
-        # Metadados de tempo/ID
+        # Metadados
         "date", "year", "tourney_date", "tourney_id", "match_num",
         "winner_id", "loser_id", "p1_id", "p2_id",
         
-        # Colunas de texto que não usamos (se não foram codificadas)
+        # Texto
         "tourney_name", "surface", "round", "tourney_level", 
         "p1_name", "p2_name", "p1_entry", "p2_entry", 
         "p1_hand", "p2_hand", "p1_ioc", "p2_ioc", 
         "score", "minutes",
         
-        # 🚨 LEAKAGE DE ESTATÍSTICAS (O culpado do AUC 1.0)
+        # 🚨 LEAKAGE ESTRUTURAL DO ELO (O motivo do AUC 1.0)
+        "elo_diff_wl",    # Vazamento matemático
+        "p1_elo_prob",    # Vazamento por Nulos (só existe pro winner)
+        "p2_elo_prob",    # Vazamento por Nulos (só existe pro winner)
+        "p1_elo_pre",     # Já usamos elo_diff e elo_prob_p1, o valor bruto pode confundir se mal tratado
+        "p2_elo_pre",
+        
+        # Stats pós-jogo
         "w_ace", "l_ace", "w_df", "l_df", "w_svpt", "l_svpt",
         "w_1stin", "l_1stin", "w_1stwon", "l_1stwon", 
         "w_2ndwon", "l_2ndwon", "w_svgms", "l_svgms", 
@@ -48,7 +54,6 @@ class TrainConfig:
         "winner_rank_points", "loser_rank_points",
         "p1_rank_points", "p2_rank_points"
     )
-
 
 def make_xy(df: pd.DataFrame, cfg: TrainConfig) -> Tuple[pd.DataFrame, np.ndarray]:
     """Prepara X e y com limpeza agressiva."""
