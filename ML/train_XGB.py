@@ -216,6 +216,12 @@ def main():
     print(f"   ✅ 2024 LogLoss: {m_val['logloss']:.5f} | AUC: {m_val['auc']:.5f}")
     print_importances(model_val)
 
-
+    # ... (final do main em ML/train_XGB.py)
+    
+    # [IMPORTANTE] Salvar o modelo para a visualização carregar depois
+    print("\n💾 Salvando modelo final...")
+    model_val.save_model("atp_model_v1.json")
+    print("✅ Modelo salvo em 'atp_model_v1.json'")
+    
 if __name__ == "__main__":
     main()
