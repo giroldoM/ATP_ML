@@ -1,227 +1,185 @@
 # ML/train_XGB.py
-from __future__ import annotations
-
-from dataclasses import dataclass, field
-from typing import Dict, Any, Tuple, List
+"""
+Script de Treinamento do Modelo XGBoost.
+Executa o loop de validação (Tuning), treina o modelo final e salva os artefatos.
+"""
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Tuple, Dict, Any, List
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score, log_loss, brier_score_loss
 
-# Ajuste os imports conforme a sua estrutura
-from ML.features import build_pairwise_dataset, EloConfig, cfg as data_cfg
-from ML.splits import make_split_plan, split_df_by_fold
-
 try:
     import xgboost as xgb
 except ImportError:
-    xgb = None
+    sys.exit("Erro Critico: Biblioteca 'xgboost' não encontrada. Instale com pip install xgboost.")
 
+# Imports locais (assumindo execução como módulo: python -m ML.train_XGB)
+from ML.features import build_pairwise_dataset, EloConfig, DataIOConfig
+from ML.splits import make_split_plan, split_df_by_fold
 
-# ----------------------------
-# Configuração Blindada
-# ----------------------------
+# -----------------------------------------------------------------------------
+# Configuração
+# -----------------------------------------------------------------------------
+
+# Caminhos
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
 
 @dataclass(frozen=True)
 class TrainConfig:
     target_col: str = "target"
     random_state: int = 42
     
-    # 🚫 LISTA NEGRA ATUALIZADA
-    drop_cols: Tuple[str, ...] = (
-        # Metadados
+    # Blacklist: Colunas que JAMAIS devem entrar no treino
+    # Inclui metadados, strings e features com vazamento de dados (leakage)
+    cols_to_drop: Tuple[str, ...] = (
         "date", "year", "tourney_date", "tourney_id", "match_num",
         "winner_id", "loser_id", "p1_id", "p2_id",
-        
-        # Texto
         "tourney_name", "surface", "round", "tourney_level", 
         "p1_name", "p2_name", "p1_entry", "p2_entry", 
         "p1_hand", "p2_hand", "p1_ioc", "p2_ioc", 
         "score", "minutes",
-        
-        # 🚨 LEAKAGE ESTRUTURAL DO ELO (O motivo do AUC 1.0)
-        "elo_diff_wl",    # Vazamento matemático
-        "p1_elo_prob",    # Vazamento por Nulos (só existe pro winner)
-        "p2_elo_prob",    # Vazamento por Nulos (só existe pro winner)
-        "p1_elo_pre",     # Já usamos elo_diff e elo_prob_p1, o valor bruto pode confundir se mal tratado
-        "p2_elo_pre",
-        "elo_diff_wl", "p1_elo_prob", "p2_elo_prob", "p1_elo_pre", "p2_elo_pre",
-        
-        # NOVO: Leakage Surface (Raw values e probabilidades do WL)
-        "winner_elo_surface", "loser_elo_surface", # Colunas originais do WL
-        "p1_elo_surface", "p2_elo_surface",        # Colunas brutas pairwise (usamos só o diff)
-        
-        # ... (stats pós jogo mantenha iguais) ...
-        
-        # Stats pós-jogo
-        "w_ace", "l_ace", "w_df", "l_df", "w_svpt", "l_svpt",
-        "w_1stin", "l_1stin", "w_1stwon", "l_1stwon", 
-        "w_2ndwon", "l_2ndwon", "w_svgms", "l_svgms", 
-        "w_bpsaved", "l_bpsaved", "w_bpfaced", "l_bpfaced",
-        "winner_rank_points", "loser_rank_points",
-        "p1_rank_points", "p2_rank_points"
+        # Leakage de Elo (valores brutos e colunas originais do WL)
+        "winner_elo_pre", "loser_elo_pre",
+        "winner_elo_surface", "loser_elo_surface",
+        "p1_elo_pre", "p2_elo_pre",
+        "p1_elo_surface", "p2_elo_surface",
     )
 
-def make_xy(df: pd.DataFrame, cfg: TrainConfig) -> Tuple[pd.DataFrame, np.ndarray]:
-    """Prepara X e y com limpeza agressiva."""
+# -----------------------------------------------------------------------------
+# Helpers de Modelagem
+# -----------------------------------------------------------------------------
+
+def prepare_xy(df: pd.DataFrame, cfg: TrainConfig) -> Tuple[pd.DataFrame, np.ndarray]:
+    """
+    Separa features (X) e target (y), aplicando limpeza rigorosa de colunas proibidas.
+    """
     if cfg.target_col not in df.columns:
-        raise ValueError(f"Missing target col: {cfg.target_col}")
+        raise ValueError(f"Coluna alvo '{cfg.target_col}' não encontrada no dataset.")
 
-    # Separa Target
     y = df[cfg.target_col].astype(int).to_numpy()
-    X = df.drop(columns=[cfg.target_col], errors="ignore")
+    X = df.drop(columns=[cfg.target_col])
 
-    # 1. Drop pela Lista Negra (Config)
-    X = X.drop(columns=list(cfg.drop_cols), errors="ignore")
+    # 1. Remove colunas da Blacklist
+    X = X.drop(columns=list(cfg.cols_to_drop), errors="ignore")
     
-    # 2. Drop extra para qualquer coluna de stats que tenha escapado
-    # (Ex: w_ace que virou w_Ace por causa de maiúsculas)
-    leakage_suffixes = ("_ace", "_df", "_svpt", "_1stin", "_1stwon", "_2ndwon", "_svgms", "_bpsaved", "_bpfaced")
-    cols_to_drop_extra = [c for c in X.columns if c.lower().endswith(leakage_suffixes) or c.lower().startswith(("w_", "l_"))]
-    if cols_to_drop_extra:
-        X = X.drop(columns=cols_to_drop_extra)
+    # 2. Varredura de Segurança: Remove colunas residuais de estatísticas (w_ace, etc)
+    # Caso alguma tenha escapado do filtro anterior
+    forbidden_substrings = ["_ace", "_df", "_svpt", "_1st", "_2nd", "_svgms", "_bp"]
+    leakage_cols = [c for c in X.columns if any(sub in c.lower() for sub in forbidden_substrings)]
+    if leakage_cols:
+        X = X.drop(columns=leakage_cols)
 
-    # 3. Garante que só sobrou número
-    X_num = X.select_dtypes(include=[np.number, bool])
+    # 3. Garante apenas dados numéricos/booleanos
+    X_clean = X.select_dtypes(include=[np.number, bool])
     
-    # Aviso se dropou algo útil sem querer
-    dropped_types = [c for c in X.columns if c not in X_num.columns]
-    if dropped_types:
-        print(f"   [make_xy] 🧹 Removendo texto/obj restante: {dropped_types}")
+    if len(X_clean.columns) < len(X.columns):
+        removed = set(X.columns) - set(X_clean.columns)
+        print(f"   [AVISO] Colunas não-numéricas removidas automaticamente: {removed}")
 
-    return X_num, y
+    return X_clean, y
 
-
-def eval_metrics(y_true: np.ndarray, y_prob: np.ndarray) -> Dict[str, float]:
-    y_prob = np.clip(y_prob, 1e-9, 1 - 1e-9)
-    return {
-        "logloss": float(log_loss(y_true, y_prob)),
-        "auc": float(roc_auc_score(y_true, y_prob)),
-        "brier": float(brier_score_loss(y_true, y_prob)),
-    }
-
-
-def fit_xgb(
-    X_train: pd.DataFrame,
-    y_train: np.ndarray,
-    X_eval: pd.DataFrame,
-    y_eval: np.ndarray,
-    *,
-    params: Dict[str, Any],
-    num_boost_round: int = 5000,
-    early_stopping_rounds: int = 200
-) -> Tuple[Any, Dict[str, float]]:
+def train_model(
+    X_train: pd.DataFrame, y_train: np.ndarray,
+    X_eval: pd.DataFrame, y_eval: np.ndarray,
+    params: Dict[str, Any]
+) -> Tuple[xgb.Booster, Dict[str, float]]:
+    """Treina o modelo XGBoost com early stopping."""
     
-    # Usa nomes das colunas para facilitar debug
-    feature_names = list(X_train.columns)
-    
-    dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=feature_names)
-    deval = xgb.DMatrix(X_eval, label=y_eval, feature_names=feature_names)
-
-    watchlist = [(dtrain, "train"), (deval, "eval")]
+    dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=list(X_train.columns))
+    deval = xgb.DMatrix(X_eval, label=y_eval, feature_names=list(X_train.columns))
 
     model = xgb.train(
         params=params,
         dtrain=dtrain,
-        num_boost_round=num_boost_round,
-        evals=watchlist,
-        early_stopping_rounds=early_stopping_rounds,
-        verbose_eval=False, # Silencioso para não poluir
+        num_boost_round=5000,
+        evals=[(dtrain, "train"), (deval, "eval")],
+        early_stopping_rounds=100,
+        verbose_eval=False
     )
 
-    best_iter = model.best_iteration
-    y_prob = model.predict(deval, iteration_range=(0, best_iter + 1))
+    # Previsão na melhor iteração
+    y_prob = model.predict(deval, iteration_range=(0, model.best_iteration + 1))
     
-    metrics = eval_metrics(y_eval, y_prob)
-    metrics["best_iteration"] = int(best_iter)
+    metrics = {
+        "logloss": log_loss(y_eval, y_prob),
+        "auc": roc_auc_score(y_eval, y_prob),
+        "brier": brier_score_loss(y_eval, y_prob),
+        "best_iter": model.best_iteration
+    }
     
     return model, metrics
 
-
-def print_importances(model, title: str = "Feature Importance"):
-    """Imprime as features reais usadas pelo modelo."""
-    importance = model.get_score(importance_type='gain')
-    if not importance:
-        print(f"[{title}] Sem features usadas.")
-        return
-        
-    sorted_importance = sorted(importance.items(), key=lambda x: x[1], reverse=True)[:10]
-    print(f"\n🔍 {title} (Top 10 Gain):")
-    for feat, val in sorted_importance:
-        print(f"   {feat:25s}: {val:.2f}")
-    print("-" * 50)
-
+# -----------------------------------------------------------------------------
+# Main Loop
+# -----------------------------------------------------------------------------
 
 def main():
-    print("🚀 Iniciando Pipeline de Treino ATP (Blindado contra Leakage)...")
-    
-    # 1. Dataset
-    # Garante que features.py está corrigido para carregar desde 2010
-    elo_cfg = EloConfig(base=1500.0, k=32.0, k_new=64.0, provisional_games=10, add_prob=True)
-    df = build_pairwise_dataset(2010, 2026, data_cfg=data_cfg, elo_cfg=elo_cfg)
-    print(f"📊 Dataset Carregado: {df.shape}")
+    print("[INFO] ATP Tennis Machine Learning Pipeline")
+    print("=========================================")
 
-    # 2. Configs
+    # 1. Preparação de Dados
+    print("\n[1] Carregando e processando dados...")
+    data_cfg = DataIOConfig(data_dir=DATA_DIR, drop_leakage=False, remove_walkovers=True)
+    elo_cfg = EloConfig(k=32.0, k_new=64.0, add_prob=True)
+    
+    # Carrega dados de 2010 até 2026
+    df = build_pairwise_dataset(2010, 2026, data_cfg=data_cfg, elo_cfg=elo_cfg)
+    print(f"   Dataset pronto: {df.shape[0]} partidas, {df.shape[1]} colunas.")
+
+    # 2. Definição do Split
     plan = make_split_plan()
     train_cfg = TrainConfig()
-
-    params = {
+    
+    # Hiperparâmetros (Poderiam estar em um arquivo yaml separado)
+    xgb_params = {
         "objective": "binary:logistic",
         "eval_metric": "logloss",
         "eta": 0.05,
         "max_depth": 4,
-        "min_child_weight": 10,
         "subsample": 0.8,
         "colsample_bytree": 0.8,
         "seed": 42,
         "nthread": -1
     }
 
-    # 3. Tuning Loop
-    print("\n--- 🔄 TUNING FOLDS ---")
-    fold_metrics = []
+    # 3. Tuning Loop (Walk-Forward)
+    print("\n[2] Iniciando Cross-Validation (Walk-Forward)...")
+    metrics_history = []
     
     for fold in plan.tuning_folds:
-        print(f"\n>> Fold: {fold.name}")
-        tr, ev = split_df_by_fold(df, fold)
-
-        Xtr, ytr = make_xy(tr, train_cfg)
-        Xev, yev = make_xy(ev, train_cfg)
+        print(f"   > Processando Fold: {fold.name} (Eval: {fold.eval_years})")
         
-        # DEBUG CRÍTICO: Imprime as colunas na primeira vez para conferir
-        if fold.name == plan.tuning_folds[0].name:
-            print(f"👀 Features REAIS entrando no modelo ({len(Xtr.columns)}):")
-            print(list(Xtr.columns))
-            print("-" * 30)
+        train_df, eval_df = split_df_by_fold(df, fold)
+        X_tr, y_tr = prepare_xy(train_df, train_cfg)
+        X_ev, y_ev = prepare_xy(eval_df, train_cfg)
 
-        model, m = fit_xgb(Xtr, ytr, Xev, yev, params=params)
-        fold_metrics.append(m)
+        _, metrics = train_model(X_tr, y_tr, X_ev, y_ev, xgb_params)
+        metrics_history.append(metrics)
         
-        print(f"   ✅ LogLoss: {m['logloss']:.5f} | AUC: {m['auc']:.5f}")
-        
-        # Mostra features do último fold para garantir
-        if fold.name == plan.tuning_folds[-1].name:
-            print_importances(model, title=f"Importances ({fold.name})")
+        print(f"      LogLoss: {metrics['logloss']:.4f} | AUC: {metrics['auc']:.4f}")
 
-    avg_loss = np.mean([x['logloss'] for x in fold_metrics])
-    print(f"\n📉 Média LogLoss Tuning: {avg_loss:.5f}")
+    avg_loss = np.mean([m['logloss'] for m in metrics_history])
+    print(f"\n   [RESUMO] Média LogLoss nos Folds: {avg_loss:.4f}")
 
-    # 4. Final Val
-    print("\n--- 🏆 FINAL VALIDATION (2024) ---")
-    tr, ev = split_df_by_fold(df, plan.final_val)
-    Xtr, ytr = make_xy(tr, train_cfg)
-    Xev, yev = make_xy(ev, train_cfg)
-    
-    model_val, m_val = fit_xgb(Xtr, ytr, Xev, yev, params=params)
-    print(f"   ✅ 2024 LogLoss: {m_val['logloss']:.5f} | AUC: {m_val['auc']:.5f}")
-    print_importances(model_val)
+    # 4. Treino Final
+    print("\n[3] Treinando Modelo Final (Validado em 2024)...")
+    tr_final, ev_final = split_df_by_fold(df, plan.final_val)
+    X_tr_f, y_tr_f = prepare_xy(tr_final, train_cfg)
+    X_ev_f, y_ev_f = prepare_xy(ev_final, train_cfg)
 
-    # ... (final do main em ML/train_XGB.py)
+    model_final, metrics_final = train_model(X_tr_f, y_tr_f, X_ev_f, y_ev_f, xgb_params)
     
-    # [IMPORTANTE] Salvar o modelo para a visualização carregar depois
-    print("\n💾 Salvando modelo final...")
-    model_val.save_model("atp_model_v1.json")
-    print("✅ Modelo salvo em 'atp_model_v1.json'")
+    print(f"   [RESULTADO] Final: LogLoss {metrics_final['logloss']:.4f} | AUC {metrics_final['auc']:.4f}")
     
+    # Salvar
+    output_path = "atp_model_v1.json"
+    model_final.save_model(output_path)
+    print(f"\n[SUCESSO] Modelo salvo com sucesso em: {output_path}")
+
 if __name__ == "__main__":
     main()

@@ -1,306 +1,198 @@
 # ML/dataio.py
-# Purpose: load ATP match CSVs by year, standardize, parse dates, filter obvious junk,
-# and (optionally) drop post-match leakage columns (w_*, l_*, score, minutes, etc.)
-
+"""
+Módulo responsável pelo carregamento, padronização e limpeza inicial dos dados da ATP.
+Garante que os DataFrames retornados tenham esquema consistente e tipos corretos.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, List, Optional
 
 import pandas as pd
+import numpy as np
 
-
-# ----------------------------
-# Config
-# ----------------------------
+# -----------------------------------------------------------------------------
+# Configuration & Constants
+# -----------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class DataIOConfig:
+    """Configuração para leitura e processamento dos arquivos CSV."""
     data_dir: Path
     filename_template: str = "atp_matches_{year}.csv"
     drop_leakage: bool = True
     remove_walkovers: bool = True
-    keep_only_singles: bool = False  # if your dataset supports it (often it doesn't)
+    keep_only_singles: bool = False
 
-
-# Minimal columns we need to proceed
+# Colunas essenciais para o funcionamento do pipeline
 REQUIRED_COLS = ("tourney_date", "winner_id", "loser_id")
 
-# Obvious post-match columns
+# Colunas que vazam informação do futuro (pós-jogo)
 LEAKAGE_EXACT = {"score", "minutes"}
-LEAKAGE_PREFIXES = ("w_", "l_")  # post-match stats prefixes in many ATP datasets
+LEAKAGE_PREFIXES = ("w_", "l_")
 
-# Common optional columns (used if present)
-OPTIONAL_ORDER_COLS = ("match_num", "tourney_id")
-
-
-# ----------------------------
+# -----------------------------------------------------------------------------
 # Public API
-# ----------------------------
+# -----------------------------------------------------------------------------
 
-def path_for_year(cfg: DataIOConfig, year: int) -> Path:
-    """Return the expected file path for a given year."""
-    return cfg.data_dir / cfg.filename_template.format(year=year)
+def read_range(cfg: DataIOConfig, start_year: int, end_year: int) -> pd.DataFrame:
+    """
+    Lê e concatena dados de partidas de um intervalo de anos (inclusive).
+    
+    Args:
+        cfg: Configuração de diretórios e filtros.
+        start_year: Ano inicial.
+        end_year: Ano final.
+        
+    Returns:
+        pd.DataFrame: DataFrame único contendo todo o histórico limpo e ordenado.
+    """
+    if end_year < start_year:
+        raise ValueError(f"end_year ({end_year}) deve ser maior ou igual a start_year ({start_year})")
+    
+    years = range(start_year, end_year + 1)
+    return read_years(cfg, years)
 
+def read_years(cfg: DataIOConfig, years: Iterable[int]) -> pd.DataFrame:
+    """Lê múltiplos anos e concatena os resultados."""
+    frames = [read_year(cfg, y) for y in years]
+    if not frames:
+        raise ValueError("Nenhum dado foi carregado. Verifique a lista de anos.")
+        
+    df = pd.concat(frames, ignore_index=True)
+    return _sort_matches(df)
 
 def read_year(cfg: DataIOConfig, year: int) -> pd.DataFrame:
     """
-    Read a single year's CSV and apply standardization + cleaning.
-    Returns a DataFrame sorted by time (and match order where possible).
+    Carrega o arquivo CSV de um ano específico, aplica padronização e filtros básicos.
     """
-    path = path_for_year(cfg, year)
-    if not path.exists():
-        raise FileNotFoundError(f"CSV for year {year} not found: {path}")
+    file_path = cfg.data_dir / cfg.filename_template.format(year=year)
+    
+    if not file_path.exists():
+        raise FileNotFoundError(f"Arquivo de dados não encontrado: {file_path}")
 
-    df = pd.read_csv(path, low_memory=False)
+    # Low_memory=False previne avisos de dtypes mistos em arquivos grandes
+    df = pd.read_csv(file_path, low_memory=False)
 
-    # Normalize columns
-    df = standardize_columns(df)
+    # Pipeline de limpeza
+    df = _standardize_columns(df)
+    _ensure_required_cols(df, REQUIRED_COLS, context=str(file_path))
+    df = _parse_date(df)
+    df = _filter_basic_rows(df, remove_walkovers=cfg.remove_walkovers)
 
-    # Check required columns early
-    ensure_required_cols(df, REQUIRED_COLS, context=str(path))
-
-    # Parse and create df["date"]
-    df = parse_date(df)
-
-    # Basic row filtering (incl. optional walkover removal)
-    df = filter_basic_rows(df, remove_walkovers=cfg.remove_walkovers)
-
-    # (Optional) singles-only filtering if dataset supports
     if cfg.keep_only_singles:
-        df = filter_only_singles_if_possible(df)
+        df = _filter_only_singles(df)
 
-    # Drop leakage columns AFTER walkover filtering (since walkover often uses score)
+    # Remoção de leakage (estatísticas pós-jogo)
     if cfg.drop_leakage:
         df = drop_leakage_cols(df)
 
-    # Sort deterministically
-    df = sort_matches(df)
+    return _sort_matches(df)
 
-    return df
+def drop_leakage_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove colunas que contêm estatísticas geradas após o término da partida."""
+    # Mantém apenas colunas que NÃO estão na lista de exclusão
+    keep_cols = [
+        c for c in df.columns 
+        if c not in LEAKAGE_EXACT and not c.startswith(LEAKAGE_PREFIXES)
+    ]
+    return df[keep_cols].copy()
 
+# -----------------------------------------------------------------------------
+# Internal Helpers (Private)
+# -----------------------------------------------------------------------------
 
-def read_years(cfg: DataIOConfig, years: Iterable[int]) -> pd.DataFrame:
-    """Read multiple years and concatenate into a single cleaned DataFrame."""
-    frames = [read_year(cfg, y) for y in years]
-    df = pd.concat(frames, ignore_index=True)
-
-    # After concat: enforce sort again (safe)
-    df = sort_matches(df)
-    return df
-
-
-def read_range(cfg: DataIOConfig, start_year: int, end_year: int) -> pd.DataFrame:
-    """Convenience: read years from start_year to end_year inclusive."""
-    if end_year < start_year:
-        raise ValueError("end_year must be >= start_year")
-    return read_years(cfg, range(start_year, end_year + 1))
-
-
-# ----------------------------
-# Helpers: standardize + validate
-# ----------------------------
-
-
-def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize column names and ensure basic types.
-    - Lowercase column names, strip whitespace.
-    - Keep tourney_date as string.
-    - Force numeric types for ranks, ages, heights, match_num, ids (handling 'NR' or strings).
-    """
+def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Padroniza nomes de colunas (lowercase) e força tipos numéricos onde necessário."""
     df = df.copy()
     df.columns = df.columns.str.strip().str.lower()
 
-    # tourney_date as string
     if "tourney_date" in df.columns:
         df["tourney_date"] = df["tourney_date"].astype(str).str.strip()
 
-    # numeric conversions (robusto)
-    cols_to_numeric = [
-        "winner_id", "loser_id",
-        "winner_rank", "loser_rank",
-        "winner_age", "loser_age",
-        "winner_ht", "loser_ht",
-        "match_num",
+    cols_numeric = [
+        "winner_id", "loser_id", "winner_rank", "loser_rank",
+        "winner_age", "loser_age", "winner_ht", "loser_ht", "match_num"
     ]
-    for c in cols_to_numeric:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
+    
+    for col in cols_numeric:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            
     return df
 
-
-
-def ensure_required_cols(df: pd.DataFrame, required: Iterable[str], context: str = "") -> None:
+def _ensure_required_cols(df: pd.DataFrame, required: Iterable[str], context: str = "") -> None:
+    """Valida se as colunas essenciais existem no DataFrame."""
     missing = [c for c in required if c not in df.columns]
     if missing:
-        msg = f"Missing required columns {missing}"
+        msg = f"Colunas obrigatórias ausentes {missing}"
         if context:
-            msg += f" in {context}"
+            msg += f" em {context}"
         raise ValueError(msg)
 
-
-# ----------------------------
-# Helpers: parsing date
-# ----------------------------
-
-def parse_date(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Create df['date'] as datetime from 'tourney_date'.
-    Handles:
-    - 'YYYYMMDD' (most common)
-    - other parseable date strings
-    Drops rows where date cannot be parsed.
-    """
+def _parse_date(df: pd.DataFrame) -> pd.DataFrame:
+    """Converte 'tourney_date' para datetime e cria a coluna 'date'."""
     df = df.copy()
-    raw = df["tourney_date"].astype(str).str.strip()
+    raw_dates = df["tourney_date"].astype(str).str.strip()
 
-    # Try strict YYYYMMDD first (fast + reliable)
-    dt = pd.to_datetime(raw, format="%Y%m%d", errors="coerce")
+    # Tenta formato padrão YYYYMMDD (mais rápido e comum)
+    dates = pd.to_datetime(raw_dates, format="%Y%m%d", errors="coerce")
 
-    # Fallback for any weird formats that weren't parsed
-    mask_bad = dt.isna()
-    if mask_bad.any():
-        dt2 = pd.to_datetime(raw[mask_bad], errors="coerce")
-        dt.loc[mask_bad] = dt2
+    # Fallback para outros formatos
+    if dates.isna().any():
+        mask_na = dates.isna()
+        dates.loc[mask_na] = pd.to_datetime(raw_dates[mask_na], errors="coerce")
 
-    df["date"] = dt
-    df = df.dropna(subset=["date"])
-    return df
+    df["date"] = dates
+    # Remove partidas onde a data não pôde ser determinada
+    return df.dropna(subset=["date"])
 
-
-# ----------------------------
-# Helpers: row filtering
-# ----------------------------
-
-
-def filter_basic_rows(df: pd.DataFrame, *, remove_walkovers: bool) -> pd.DataFrame:
-    """
-    Remove invalid rows:
-    - missing winner_id / loser_id
-    - winner_id == loser_id
-    - (optional) walkovers, if detectable via 'score'
-    """
-    df = df.copy()
-
+def _filter_basic_rows(df: pd.DataFrame, remove_walkovers: bool) -> pd.DataFrame:
+    """Remove linhas inválidas (IDs nulos, IDs iguais) e W.O."""
     df = df.dropna(subset=["winner_id", "loser_id"])
     df = df[df["winner_id"] != df["loser_id"]]
 
     if remove_walkovers and "score" in df.columns:
         score = df["score"].astype(str).str.upper()
-
-        # pega W/O, WO, WALKOVER (WO simples acontece)
-        is_wo = (
-            score.str.contains(r"\bW/O\b", na=False, regex=True)
-            | score.str.contains(r"\bWO\b", na=False, regex=True)
-            | score.str.contains("WALKOVER", na=False)
-        )
+        # Regex simplificado para detectar W/O
+        is_wo = score.str.contains(r"\b(W/O|WO|WALKOVER)\b", regex=True, na=False)
         df = df[~is_wo]
 
     return df
 
-
-
-def filter_only_singles_if_possible(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Tries to filter to singles only if dataset contains a relevant column.
-    If no such column exists, returns df unchanged.
-    """
-    df = df.copy()
-
-    # Different datasets name these differently; we try a few patterns.
-    # If none exist, do nothing.
-    candidates = [
-        "match_type",     # e.g., "S" or "D"
-        "event_type",
-        "doubles",
-        "is_doubles",
-    ]
+def _filter_only_singles(df: pd.DataFrame) -> pd.DataFrame:
+    """Tenta filtrar apenas jogos de simples baseado em heurísticas de colunas comuns."""
+    # Lista de possíveis nomes de colunas que indicam o tipo de jogo
+    candidates = ["match_type", "event_type", "doubles", "is_doubles"]
     col = next((c for c in candidates if c in df.columns), None)
-    if col is None:
+    
+    if not col:
         return df
 
     s = df[col].astype(str).str.strip().str.upper()
-    # Heuristics:
-    # - if values contain "S"/"D"
-    # - or booleans for doubles
+    
     if s.isin(["S", "SINGLES"]).any():
         return df[s.isin(["S", "SINGLES"])]
     if s.isin(["D", "DOUBLES"]).any():
         return df[~s.isin(["D", "DOUBLES"])]
-    if s.isin(["TRUE", "FALSE"]).any():
-        return df[s.isin(["FALSE"])]
-    if s.isin(["0", "1"]).any():
-        return df[s.isin(["0"])]
-
-    # If it doesn't match any known schema, don't guess.
+    if s.isin(["0", "1"]).any(): # Assumindo 0 = Singles, 1 = Doubles
+        return df[s == "0"]
+        
     return df
 
-
-# ----------------------------
-# Helpers: leakage control
-# ----------------------------
-
-def drop_leakage_cols(df: pd.DataFrame) -> pd.DataFrame:
+def _sort_matches(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Remove post-match columns:
-    - exact: score, minutes
-    - prefixes: w_*, l_*
+    Ordenação determinística crítica para evitar Data Leakage em séries temporais.
+    Ordem: Data -> Torneio -> Número da Partida.
     """
-    keep_cols: list[str] = []
-    for c in df.columns:
-        if c in LEAKAGE_EXACT:
-            continue
-        if c.startswith(LEAKAGE_PREFIXES):
-            continue
-        keep_cols.append(c)
-    return df[keep_cols].copy()
-
-
-# ----------------------------
-# Helpers: sorting
-# ----------------------------
-
-def sort_matches(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Sort deterministically:
-    - by date ascending
-    - then by tourney_id (agrupa o torneio)
-    - then by match_num (CRÍTICO: garante ordem correta R1 -> Final dentro do torneio)
-    - else stable by winner_id/loser_id
-    """
-    df = df.copy()
-
-    # Ordem de prioridade para evitar leakage intra-torneio
     sort_cols = ["date"]
+    if "tourney_id" in df.columns: sort_cols.append("tourney_id")
+    if "match_num" in df.columns: sort_cols.append("match_num")
     
-    # Se tivermos tourney_id e match_num, eles são a verdade absoluta da ordem
-    if "tourney_id" in df.columns:
-        sort_cols.append("tourney_id")
-    if "match_num" in df.columns:
-        sort_cols.append("match_num")
-
-    # Fallback stable cols (caso falte match_num, o que é raro em ATP oficial)
+    # Fallback para IDs se match_num não existir (raro)
     for c in ("winner_id", "loser_id"):
         if c in df.columns and c not in sort_cols:
             sort_cols.append(c)
 
-    df = df.sort_values(sort_cols, ascending=True, kind="mergesort").reset_index(drop=True)
-    return df
-
-
-# ----------------------------
-# Minimal manual test
-# ----------------------------
-
-if __name__ == "__main__":
-    cfg = DataIOConfig(data_dir=Path("data"), drop_leakage=True, remove_walkovers=True)
-    df = read_range(cfg, 2010, 2012)
-    print("Loaded:", df.shape)
-    print("Cols (sample):", list(df.columns)[:25])
-    """print(df[["date", "winner_id", "loser_id"]].head())"""
-    print("\nPrimeira linha organizada:")
-    print(df.iloc[0].to_string())
-
+    return df.sort_values(sort_cols, ascending=True, kind="mergesort").reset_index(drop=True)
