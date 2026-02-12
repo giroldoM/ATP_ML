@@ -21,4 +21,4 @@ lxml>=5.1
 tenacity>=8.2
 plotly>=5.18
 
-graphviz
+graphviz >=0.20
