@@ -1,4 +1,4 @@
-# Betting/calibrate_probs.py
+# calibrate_probs.py
 from __future__ import annotations
 
 import argparse
