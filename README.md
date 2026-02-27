@@ -42,7 +42,7 @@ O modelo utiliza apenas informações disponíveis **antes** do início da parti
 * **LogLoss**: 0.60694
 * **AUC**: 0.72537
 * **BRIER**: 0.20837
-* **AUC**: 0.0000
+* **ECE10**: 0.0000
 
 ### Importância das Features (Top 5)
 1. elo_prob_p1
