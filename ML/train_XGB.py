@@ -20,7 +20,7 @@ except ImportError:
 # Imports locais (assumindo execução como módulo: python -m ML.train_XGB)
 from ML.features import build_pairwise_dataset, EloConfig, DataIOConfig
 from ML.splits import make_split_plan, split_df_by_fold
-
+import optuna
 # -----------------------------------------------------------------------------
 # Configuração
 # -----------------------------------------------------------------------------
@@ -118,65 +118,73 @@ def train_model(
 # Main Loop
 # -----------------------------------------------------------------------------
 
-def main():
-    print("[INFO] ATP Tennis Machine Learning Pipeline")
-    print("=========================================")
 
-    # 1. Preparação de Dados
+
+
+def main():
+    print("[INFO] ATP Tennis Machine Learning Pipeline com Optuna Tuning")
+    print("==============================================================")
+
     print("\n[1] Carregando e processando dados...")
     data_cfg = DataIOConfig(data_dir=DATA_DIR, drop_leakage=False, remove_walkovers=True)
     elo_cfg = EloConfig(k=32.0, k_new=64.0, add_prob=True)
     
-    # Carrega dados de 2010 até 2026
-    df = build_pairwise_dataset(2010, 2026, data_cfg=data_cfg, elo_cfg=elo_cfg)
-    print(f"   Dataset pronto: {df.shape[0]} partidas, {df.shape[1]} colunas.")
-
-    # 2. Definição do Split
+    df = build_pairwise_dataset(2010, 2024, data_cfg=data_cfg, elo_cfg=elo_cfg)
     plan = make_split_plan()
     train_cfg = TrainConfig()
-    
-    # Hiperparâmetros (Poderiam estar em um arquivo yaml separado)
-    xgb_params = {
-        "objective": "binary:logistic",
-        "eval_metric": "logloss",
-        "eta": 0.05,
-        "max_depth": 4,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "seed": 42,
-        "nthread": -1
-    }
 
-    # 3. Tuning Loop (Walk-Forward)
-    print("\n[2] Iniciando Cross-Validation (Walk-Forward)...")
-    metrics_history = []
-    
-    for fold in plan.tuning_folds:
-        print(f"   > Processando Fold: {fold.name} (Eval: {fold.eval_years})")
+    # Função objetivo para o Optuna
+    def objective(trial):
+        xgb_params = {
+            "objective": "binary:logistic",
+            "eval_metric": "logloss",
+            "eta": trial.suggest_float("eta", 0.01, 0.2, log=True),
+            "max_depth": trial.suggest_int("max_depth", 2, 7),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 15),
+            "gamma": trial.suggest_float("gamma", 0.0, 5.0),
+            "seed": 42,
+            "nthread": -1
+        }
         
-        train_df, eval_df = split_df_by_fold(df, fold)
-        X_tr, y_tr = prepare_xy(train_df, train_cfg)
-        X_ev, y_ev = prepare_xy(eval_df, train_cfg)
+        fold_losses = []
+        # Usa os mesmos folds de tuning que você já tinha configurado
+        for fold in plan.tuning_folds:
+            train_df, eval_df = split_df_by_fold(df, fold)
+            X_tr, y_tr = prepare_xy(train_df, train_cfg)
+            X_ev, y_ev = prepare_xy(eval_df, train_cfg)
 
-        _, metrics = train_model(X_tr, y_tr, X_ev, y_ev, xgb_params)
-        metrics_history.append(metrics)
-        
-        print(f"      LogLoss: {metrics['logloss']:.4f} | AUC: {metrics['auc']:.4f}")
+            _, metrics = train_model(X_tr, y_tr, X_ev, y_ev, xgb_params)
+            
+            # Aqui estamos minimizando o Brier Score, já que é seu alvo principal de melhoria
+            fold_losses.append(metrics['brier']) 
 
-    avg_loss = np.mean([m['logloss'] for m in metrics_history])
-    print(f"\n   [RESUMO] Média LogLoss nos Folds: {avg_loss:.4f}")
+        return np.mean(fold_losses)
 
-    # 4. Treino Final
-    print("\n[3] Treinando Modelo Final (Validado em 2024)...")
+    print("\n[2] Iniciando Busca de Hiperparâmetros (Optuna)...")
+    # Cria o estudo buscando minimizar o Brier Score
+    study = optuna.create_study(direction="minimize")
+    # n_trials=30 é um bom começo. Para rodar a noite, coloque 100 ou 200.
+    study.optimize(objective, n_trials=30, show_progress_bar=True)
+
+    print("\n   [RESUMO OPTUNA] Melhores Parâmetros Encontrados:")
+    best_params = study.best_params
+    best_params.update({"objective": "binary:logistic", "eval_metric": "logloss", "seed": 42, "nthread": -1})
+    for k, v in best_params.items():
+        print(f"      {k}: {v}")
+    print(f"      Melhor Brier Score Médio na Validação: {study.best_value:.4f}")
+
+    # 4. Treino Final com os parâmetros tunados
+    print("\n[3] Treinando Modelo Final (Validado no fold final)...")
     tr_final, ev_final = split_df_by_fold(df, plan.final_val)
     X_tr_f, y_tr_f = prepare_xy(tr_final, train_cfg)
     X_ev_f, y_ev_f = prepare_xy(ev_final, train_cfg)
 
-    model_final, metrics_final = train_model(X_tr_f, y_tr_f, X_ev_f, y_ev_f, xgb_params)
+    model_final, metrics_final = train_model(X_tr_f, y_tr_f, X_ev_f, y_ev_f, best_params)
     
-    print(f"   [RESULTADO] Final: LogLoss {metrics_final['logloss']:.4f} | AUC {metrics_final['auc']:.4f}")
+    print(f"   [RESULTADO] Final: LogLoss {metrics_final['logloss']:.4f} | AUC {metrics_final['auc']:.4f} | Brier {metrics_final['brier']:.4f}")
     
-    # Salvar
     output_path = "atp_model_v1.json"
     model_final.save_model(output_path)
     print(f"\n[SUCESSO] Modelo salvo com sucesso em: {output_path}")
