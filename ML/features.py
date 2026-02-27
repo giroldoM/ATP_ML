@@ -12,6 +12,7 @@ from typing import Dict, Optional, Tuple
 
 import pandas as pd
 import numpy as np
+import math
 
 # Import relativo para manter o pacote coeso
 from .dataio import DataIOConfig, read_range, drop_leakage_cols
@@ -37,13 +38,37 @@ def _calculate_elo_probability(r_a: float, r_b: float) -> float:
     """Calcula a probabilidade esperada de A vencer B dado seus ratings."""
     return 1.0 / (1.0 + 10 ** ((r_b - r_a) / 400.0))
 
+def _get_margin_multiplier(score_str: str) -> float:
+    """
+    Calcula a margem de vitória em games e retorna um multiplicador para o Elo.
+    Lida com segurança com valores nulos, vazios ou jogos incompletos (W/O, RET).
+    """
+    if not isinstance(score_str, str) or not score_str.strip() or "RET" in score_str or "W/O" in score_str:
+        return 1.0 
+
+    w_games, l_games = 0, 0
+    for set_score in score_str.split():
+        if '-' in set_score:
+            parts = set_score.split('-')
+            try:
+                # Extrai os games ignorando o tie-break ex: "7-6(5)" vira 7 e 6
+                w = int(parts[0].split('(')[0])
+                l = int(parts[1].split('(')[0])
+                w_games += w
+                l_games += l
+            except ValueError:
+                continue
+                
+    margin = w_games - l_games
+    margin = max(1.0, float(margin)) # Garante um mínimo de 1 para evitar log(0)
+    
+    # Aplica log natural para suavizar o impacto de margens gigantes (ex: 6-0 6-0)
+    return math.log(margin + 1.718)
+
 def add_elo_wl(df_wl: pd.DataFrame, elo_cfg: EloConfig) -> pd.DataFrame:
     """
     Calcula e anexa o Elo Rating PRÉ-JOGO (Global e por Superfície) ao DataFrame.
-    
-    O algoritmo itera cronologicamente partida a partida.
-    IMPORTANTE: Os valores anexados são sempre o rating *antes* da partida acontecer,
-    evitando Data Leakage.
+    O algoritmo itera cronologicamente partida a partida aplicando margem de vitória.
     """
     df = df_wl.copy()
     
@@ -68,6 +93,10 @@ def add_elo_wl(df_wl: pd.DataFrame, elo_cfg: EloConfig) -> pd.DataFrame:
         w_id = int(getattr(row, "winner_id"))
         l_id = int(getattr(row, "loser_id"))
         
+        # Pega a string do placar e calcula o multiplicador de margem
+        score_str = getattr(row, "score", "")
+        mov_mult = _get_margin_multiplier(score_str)
+        
         # Normalização da superfície
         surf_raw = getattr(row, "surface", "Hard")
         surf = str(surf_raw).strip().title() if isinstance(surf_raw, str) else "Hard"
@@ -87,8 +116,13 @@ def add_elo_wl(df_wl: pd.DataFrame, elo_cfg: EloConfig) -> pd.DataFrame:
         # K dinâmico baseado na experiência do jogador
         gw_g = games_global.get(w_id, 0)
         gl_g = games_global.get(l_id, 0)
-        k_w = elo_cfg.k_new if gw_g < elo_cfg.provisional_games else elo_cfg.k
-        k_l = elo_cfg.k_new if gl_g < elo_cfg.provisional_games else elo_cfg.k
+        
+        base_k_w = elo_cfg.k_new if gw_g < elo_cfg.provisional_games else elo_cfg.k
+        base_k_l = elo_cfg.k_new if gl_g < elo_cfg.provisional_games else elo_cfg.k
+        
+        # Aplica o multiplicador da margem de vitória
+        k_w = base_k_w * mov_mult
+        k_l = base_k_l * mov_mult
         
         ratings_global[w_id] = r_w_g + k_w * (1.0 - prob_w_g)
         ratings_global[l_id] = r_l_g + k_l * (0.0 - (1.0 - prob_w_g))
@@ -110,8 +144,12 @@ def add_elo_wl(df_wl: pd.DataFrame, elo_cfg: EloConfig) -> pd.DataFrame:
         gw_s = g_dict.get(w_id, 0)
         gl_s = g_dict.get(l_id, 0)
         
-        k_w_s = elo_cfg.k_new if gw_s < elo_cfg.provisional_games else elo_cfg.k
-        k_l_s = elo_cfg.k_new if gl_s < elo_cfg.provisional_games else elo_cfg.k
+        base_k_w_s = elo_cfg.k_new if gw_s < elo_cfg.provisional_games else elo_cfg.k
+        base_k_l_s = elo_cfg.k_new if gl_s < elo_cfg.provisional_games else elo_cfg.k
+        
+        # Aplica o multiplicador da margem de vitória
+        k_w_s = base_k_w_s * mov_mult
+        k_l_s = base_k_l_s * mov_mult
         
         r_dict[w_id] = r_w_s + k_w_s * (1.0 - prob_w_s)
         r_dict[l_id] = r_l_s + k_l_s * (0.0 - (1.0 - prob_w_s))
@@ -125,16 +163,111 @@ def add_elo_wl(df_wl: pd.DataFrame, elo_cfg: EloConfig) -> pd.DataFrame:
     return df
 
 # -----------------------------------------------------------------------------
+# Advanced Stats Engine (H2H, Fatigue, Serve)
+# -----------------------------------------------------------------------------
+def add_advanced_stats_wl(df_wl: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calcula estatísticas avançadas PRÉ-JOGO.
+    Deve ser chamada ANTES do drop_leakage_cols para poder ler estatísticas passadas.
+    """
+    df = df_wl.copy()
+
+    # Dicionários de Estado (Memória)
+    h2h_records = {}         # (id_menor, id_maior) -> Saldo do id_menor
+    player_matches_dates = {} # id -> [lista de datas dos últimos jogos]
+    player_serve_pts = {}    # id -> [(total_pontos_saque, pontos_ganhos)]
+
+    w_h2h_list, l_h2h_list = [], []
+    w_fatigue_list, l_fatigue_list = [], []
+    w_serve_pct_list, l_serve_pct_list = [], []
+    
+    for row in df.itertuples(index=False):
+        w_id = int(getattr(row, "winner_id"))
+        l_id = int(getattr(row, "loser_id"))
+        current_date = getattr(row, "date")
+        
+        # --- 1. HEAD-TO-HEAD (H2H) ---
+        matchup_key = tuple(sorted((w_id, l_id)))
+        saldo_menor_id = h2h_records.get(matchup_key, 0)
+        
+        if w_id < l_id:
+            w_h2h_list.append(saldo_menor_id)
+            l_h2h_list.append(-saldo_menor_id)
+        else:
+            w_h2h_list.append(-saldo_menor_id)
+            l_h2h_list.append(saldo_menor_id)
+            
+        # --- 2. FADIGA (Jogos nos últimos 14 dias) ---
+        w_dates = player_matches_dates.get(w_id, [])
+        l_dates = player_matches_dates.get(l_id, [])
+        
+        # Filtra apenas datas recentes (últimos 14 dias)
+        w_dates_valid = [d for d in w_dates if (current_date - d).days <= 14]
+        l_dates_valid = [d for d in l_dates if (current_date - d).days <= 14]
+        
+        w_fatigue_list.append(len(w_dates_valid))
+        l_fatigue_list.append(len(l_dates_valid))
+        
+        # --- 3. MÉDIA DE SAQUE (Últimos 10 jogos) ---
+        w_serve = player_serve_pts.get(w_id, [])
+        l_serve = player_serve_pts.get(l_id, [])
+        
+        def calc_pct(stats_list):
+            if not stats_list: return 0.62 # Média histórica da ATP ~62%
+            tot_svpt = sum(x[0] for x in stats_list)
+            tot_won = sum(x[1] for x in stats_list)
+            return tot_won / tot_svpt if tot_svpt > 0 else 0.62
+            
+        w_serve_pct_list.append(calc_pct(w_serve))
+        l_serve_pct_list.append(calc_pct(l_serve))
+        
+        # ==========================================
+        # ATUALIZAÇÃO DO ESTADO (PÓS-JOGO)
+        # ==========================================
+        # Atualiza H2H
+        if w_id < l_id:
+            h2h_records[matchup_key] = saldo_menor_id + 1
+        else:
+            h2h_records[matchup_key] = saldo_menor_id - 1
+            
+        # Atualiza Fadiga
+        w_dates_valid.append(current_date)
+        l_dates_valid.append(current_date)
+        player_matches_dates[w_id] = w_dates_valid
+        player_matches_dates[l_id] = l_dates_valid
+        
+        # Atualiza Saque (Atenção: dataio.py passa tudo para minúsculas)
+        w_svpt = getattr(row, "w_svpt", 0)
+        w_1stwon = getattr(row, "w_1stwon", 0)
+        w_2ndwon = getattr(row, "w_2ndwon", 0)
+        if pd.notna(w_svpt) and w_svpt > 0:
+            player_serve_pts.setdefault(w_id, []).append((w_svpt, w_1stwon + w_2ndwon))
+            player_serve_pts[w_id] = player_serve_pts[w_id][-10:] # Mantém só os últimos 10
+            
+        l_svpt = getattr(row, "l_svpt", 0)
+        l_1stwon = getattr(row, "l_1stwon", 0)
+        l_2ndwon = getattr(row, "l_2ndwon", 0)
+        if pd.notna(l_svpt) and l_svpt > 0:
+            player_serve_pts.setdefault(l_id, []).append((l_svpt, l_1stwon + l_2ndwon))
+            player_serve_pts[l_id] = player_serve_pts[l_id][-10:]
+
+    # Anexa as colunas calculadas ao DataFrame
+    df["winner_h2h"] = w_h2h_list
+    df["loser_h2h"] = l_h2h_list
+    df["winner_fatigue"] = w_fatigue_list
+    df["loser_fatigue"] = l_fatigue_list
+    df["winner_serve_pct"] = w_serve_pct_list
+    df["loser_serve_pct"] = l_serve_pct_list
+    
+    return df
+
+# -----------------------------------------------------------------------------
 # Dataset Transformation (W/L -> Pairwise)
 # -----------------------------------------------------------------------------
 
 def create_pairwise_data(df: pd.DataFrame) -> pd.DataFrame:
     """
     Transforma o formato Winner/Loser (W/L) em Player 1 / Player 2 (P1/P2).
-    
-    Duplica os dados para garantir simetria:
-    - Cenário A: P1 = Winner, P2 = Loser, Target = 1
-    - Cenário B: P1 = Loser, P2 = Winner, Target = 0
     """
     # 1. Criação do lado Positivo (Winner é P1)
     df_pos = df.copy()
@@ -179,12 +312,10 @@ def add_basic_features_pairwise(df: pd.DataFrame) -> pd.DataFrame:
             out[p2_col] = out[p2_col].fillna(fill_val)
             
             diff_col = f"{col_base}_diff{suffix}"
-            out[diff_col] = out[p1_col] - out[p2_col]
             
-            # Para Rank, menor é melhor. Se P1 < P2, P1 é favorito.
-            # Delta normal = P1 - P2. Se for negativo, P1 é favorito.
+            # Para Rank, menor é melhor.
             if col_base == "rank":
-                out[diff_col] = out[p2_col] - out[p1_col] # Inverte para: Positivo = P1 tem rank melhor
+                out[diff_col] = out[p2_col] - out[p1_col]
             else:
                 out[diff_col] = out[p1_col] - out[p2_col]
 
@@ -208,7 +339,7 @@ def add_basic_features_pairwise(df: pd.DataFrame) -> pd.DataFrame:
         out["surface_code"] = out["surface"].map(surf_map).fillna(-1)
 
     # Hand (Canhoto vs Destro)
-    hands = {"R": 0, "L": 1, "U": 2}
+        hands = {"R": 0, "L": 1, "U": 2}
     for p in ["p1", "p2"]:
         if f"{p}_hand" in out.columns:
             out[f"{p}_hand_code"] = out[f"{p}_hand"].fillna("U").str.upper().map(hands).fillna(2)
@@ -216,9 +347,19 @@ def add_basic_features_pairwise(df: pd.DataFrame) -> pd.DataFrame:
     # Interação Específica (Lefty vs Righty)
     if "p1_hand_code" in out.columns and "p2_hand_code" in out.columns:
         h1, h2 = out["p1_hand_code"], out["p2_hand_code"]
-        # 0=Right, 1=Left.
         out["is_lefty_vs_righty"] = ((h1 == 0) & (h2 == 1)) | ((h1 == 1) & (h2 == 0))
         out["is_lefty_vs_righty"] = out["is_lefty_vs_righty"].astype(int)
+
+    # Novas Diferenças (Fadiga, H2H e Saque)
+    if "p1_fatigue" in out.columns and "p2_fatigue" in out.columns:
+        out["fatigue_diff"] = out["p1_fatigue"] - out["p2_fatigue"]
+    
+    if "p1_serve_pct" in out.columns and "p2_serve_pct" in out.columns:
+        out["serve_pct_diff"] = out["p1_serve_pct"] - out["p2_serve_pct"]
+        
+    if "p1_h2h" in out.columns:
+        # p1_h2h já é o saldo direto do P1 contra o P2, não precisa subtrair.
+        out["h2h_saldo"] = out["p1_h2h"] 
 
     return out
 
@@ -235,48 +376,38 @@ def build_pairwise_dataset(
 ) -> pd.DataFrame:
     """
     Pipeline completo: 
-    Carrega -> Calcula Elo Histórico -> Remove Vazamento -> Transforma Pairwise -> Limpa.
+    Carrega -> Calcula Elo Histórico -> Estatísticas Avançadas -> Remove Vazamento -> Transforma Pairwise -> Limpa.
     """
-    # 1. Carregamento Histórico (Elo precisa de passado para convergir)
-    # Fixamos 2010 como início do "Big Bang" dos dados para ter histórico
     load_start_year = 2010 
     
-    # Forçamos drop_leakage=False aqui para ter acesso aos metadados durante cálculo de features
-    # (ex: estatísticas passadas). O drop real acontece depois.
     temp_cfg = dataclass_replace(data_cfg, drop_leakage=False)
     
     df_wl = read_range(temp_cfg, load_start_year, end_year)
 
-    # 2. Cálculo de Features Temporais (Elo)
     if elo_cfg:
         df_wl = add_elo_wl(df_wl, elo_cfg)
 
-    # 3. Remoção Segura de Leakage
-    # Agora removemos colunas como 'score', 'w_ace', etc, pois o jogo já "aconteceu"
+    # Estatísticas Avançadas antes de dropar o Leakage!
+    df_wl = add_advanced_stats_wl(df_wl)
+
     df_wl = drop_leakage_cols(df_wl)
 
-    # 4. Transformação Pairwise
     df_pw = create_pairwise_data(df_wl)
     df_pw = add_basic_features_pairwise(df_pw)
 
-    # 5. Filtragem Final de Data
-    # Cortamos apenas os anos solicitados pelo usuário para treino/teste
     if "date" in df_pw.columns:
         year_col = df_pw["date"].dt.year
         df_pw = df_pw[(year_col >= start_year) & (year_col <= end_year)]
 
-    # 6. Limpeza de Metadados
-    # Removemos IDs e colunas de texto que não servem para o modelo
     cols_drop = [
         "match_num", "tourney_id", "tourney_date", 
         "winner_id", "loser_id", "p1_id", "p2_id", 
-        "p1_name", "p2_name"
+        "p1_name", "p2_name", "score" # Removendo score final para não haver leakage
     ]
     df_pw = df_pw.drop(columns=cols_drop, errors="ignore")
 
     return df_pw
 
 def dataclass_replace(obj, **kwargs):
-    """Helper para substituir valores em dataclasses frozen (Python < 3.10 clean fix)."""
     from dataclasses import replace
     return replace(obj, **kwargs)
