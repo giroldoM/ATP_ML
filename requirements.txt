@@ -22,3 +22,4 @@ tenacity>=8.2
 plotly>=5.18
 
 graphviz >=0.20
+optuna >=3.5
